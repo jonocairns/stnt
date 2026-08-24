@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source=${BASH_SOURCE[0]}
+while [[ -L $source ]]; do
+  source_dir=$(cd -P "$(dirname "$source")" && pwd)
+  source=$(readlink "$source")
+  if [[ $source != /* ]]; then
+    source=$source_dir/$source
+  fi
+done
+root=$(cd -P "$(dirname "$source")/.." && pwd)
+
+# /usr/bin/python3 is an Apple dispatcher. Project Nix shells can point
+# DEVELOPER_DIR at an SDK without Python, causing that dispatcher to fall
+# through to an unrelated asdf shim. Resolve the host developer toolchain
+# without project SDK overrides, then invoke its actual interpreter directly.
+developer_dir=$(env -u DEVELOPER_DIR -u SDKROOT /usr/bin/xcode-select -p)
+python="$developer_dir/usr/bin/python3"
+if [[ ! -x $python ]]; then
+  echo "stnt: macOS developer-tools Python is unavailable; next: xcode-select --install" >&2
+  exit 1
+fi
+
+exec "$python" "$root/src/stnt.py" "$@"

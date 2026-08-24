@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+stub=$(mktemp -d)
+trap 'rm -rf "$stub"' EXIT
+
+cat >"$stub/sbx" <<'EOF'
+#!/usr/bin/env bash
+[[ $1 == ports && $3 == --json ]]
+if [[ -n ${STNT_PORT_STATUS:-} ]]; then
+  exit "$STNT_PORT_STATUS"
+fi
+cat "$STNT_PORT_FIXTURE"
+EOF
+chmod +x "$stub/sbx"
+
+expect_failure() {
+  label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    echo "FAIL $label: unexpectedly succeeded" >&2
+    exit 1
+  fi
+  echo "PASS $label"
+}
+
+cat >"$stub/valid.json" <<'EOF'
+[
+  {"host_ip":"127.0.0.1","host_port":49175,"sandbox_port":8000,"protocol":"tcp"},
+  {"host_ip":"::1","host_port":49175,"sandbox_port":8000,"protocol":"tcp"}
+]
+EOF
+mapping=$(
+  env PATH="$stub:$PATH" STNT_PORT_FIXTURE="$stub/valid.json" \
+    "$root/bin/docker-sandbox" port synthetic 8000
+)
+jq -e '
+  .host_ip == "127.0.0.1" and
+  .host_port == 49175 and
+  .sandbox_port == 8000 and
+  .protocol == "tcp"
+' <<<"$mapping" >/dev/null
+echo "PASS machine-readable IPv4 port selection"
+
+printf '{}\n' >"$stub/malformed.json"
+expect_failure "malformed port inventory" \
+  env PATH="$stub:$PATH" STNT_PORT_FIXTURE="$stub/malformed.json" \
+  "$root/bin/docker-sandbox" port synthetic 8000
+
+cat >"$stub/duplicate.json" <<'EOF'
+[
+  {"host_ip":"127.0.0.1","host_port":49175,"sandbox_port":8000,"protocol":"tcp"},
+  {"host_ip":"127.0.0.1","host_port":49176,"sandbox_port":8000,"protocol":"tcp"}
+]
+EOF
+expect_failure "ambiguous IPv4 port inventory" \
+  env PATH="$stub:$PATH" STNT_PORT_FIXTURE="$stub/duplicate.json" \
+  "$root/bin/docker-sandbox" port synthetic 8000
+
+expect_failure "provider exit 4 is not mapping absence" \
+  env PATH="$stub:$PATH" STNT_PORT_FIXTURE="$stub/valid.json" STNT_PORT_STATUS=4 \
+  "$root/bin/docker-sandbox" port synthetic 8000

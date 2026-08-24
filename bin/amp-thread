@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "usage: $0 {new|continue|list|status|archive|unarchive} [thread-id]" >&2
+  exit 2
+}
+
+list_threads() {
+  output=$1
+  shift
+  page=$(mktemp)
+  combined=$(mktemp)
+  offset=0
+  printf '[]\n' >"$output"
+
+  while true; do
+    if ! amp threads list --json --limit 500 --offset "$offset" "$@" >"$page"; then
+      rm -f "$page" "$combined"
+      return 1
+    fi
+    if ! jq -e 'type == "array" and all(.[]; type == "object" and (.id | type == "string"))' \
+      "$page" >/dev/null; then
+      rm -f "$page" "$combined"
+      return 1
+    fi
+    jq -s 'add' "$output" "$page" >"$combined"
+    mv "$combined" "$output"
+    count=$(jq 'length' "$page")
+    [[ $count -eq 500 ]] || break
+    offset=$((offset + count))
+  done
+
+  rm -f "$page" "$combined"
+}
+
+command=${1:-}
+case "$command" in
+  new)
+    amp threads new
+    ;;
+  continue)
+    [[ $# -eq 2 ]] || usage
+    exec amp threads continue "$2"
+    ;;
+  archive)
+    [[ $# -eq 2 ]] || usage
+    amp threads archive "$2"
+    ;;
+  unarchive)
+    [[ $# -eq 2 ]] || usage
+    amp threads archive --unarchive "$2"
+    ;;
+  list)
+    [[ $# -eq 1 ]] || usage
+    active=$(mktemp)
+    inclusive=$(mktemp)
+    trap 'rm -f "$active" "$inclusive"' EXIT
+    if ! list_threads "$active"; then
+      echo "lookup-failed: active thread list unavailable" >&2
+      exit 2
+    fi
+    if ! list_threads "$inclusive" --include-archived; then
+      echo "lookup-failed: archived-inclusive thread list unavailable" >&2
+      exit 2
+    fi
+    if ! jq -e 'all(.[]; (.id|type)=="string" and (.id|test("^T-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) and ((has("title")|not) or .title == null or (.title|type)=="string")) and (map(.id)|length)==(map(.id)|unique|length)' "$active" >/dev/null ||
+       ! jq -e 'all(.[]; (.id|type)=="string" and (.id|test("^T-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$")) and ((has("title")|not) or .title == null or (.title|type)=="string")) and (map(.id)|length)==(map(.id)|unique|length)' "$inclusive" >/dev/null ||
+       ! jq -e --slurpfile inclusive "$inclusive" 'all(.[]; .id as $id | ([$inclusive[0][] | select(.id == $id)] | length == 1))' "$active" >/dev/null; then
+      echo "lookup-failed: invalid or duplicate thread list contract" >&2
+      exit 2
+    fi
+    jq -n --slurpfile active "$active" --slurpfile inclusive "$inclusive" '
+      ($active[0] | map(.id) | INDEX(.)) as $active_ids |
+      $inclusive[0] | map({id, title: (.title // ""), status: (if $active_ids[.id] then "active" else "archived" end)})'
+    ;;
+  status)
+    [[ $# -eq 2 ]] || usage
+    thread_id=$2
+    active=$(mktemp)
+    inclusive=$(mktemp)
+    trap 'rm -f "$active" "$inclusive"' EXIT
+
+    if ! list_threads "$active"; then
+      echo "lookup-failed: active thread list unavailable" >&2
+      exit 2
+    fi
+    active_count=$(jq --arg id "$thread_id" '[.[] | select(.id == $id)] | length' "$active")
+    if [[ $active_count -gt 1 ]]; then
+      echo "lookup-failed: duplicate thread ID in active list" >&2
+      exit 2
+    fi
+    if [[ $active_count -eq 1 ]]; then
+      echo active
+      exit 0
+    fi
+    if ! list_threads "$inclusive" --include-archived; then
+      echo "lookup-failed: archived-inclusive thread list unavailable" >&2
+      exit 2
+    fi
+    inclusive_count=$(jq --arg id "$thread_id" '[.[] | select(.id == $id)] | length' "$inclusive")
+    if [[ $inclusive_count -gt 1 ]]; then
+      echo "lookup-failed: duplicate thread ID in archived-inclusive list" >&2
+      exit 2
+    fi
+    if [[ $inclusive_count -eq 1 ]]; then
+      echo archived
+      exit 0
+    fi
+    # Empty threads can be omitted from both lists, including after archive.
+    # Direct export is supported and carries the authoritative archive flag.
+    exported=$(mktemp)
+    trap 'rm -f "$active" "$inclusive" "$exported"' EXIT
+    if ! amp threads export "$thread_id" >"$exported"; then
+      echo "lookup-failed: list-omitted thread export unavailable" >&2
+      exit 2
+    fi
+    if ! jq -e --arg id "$thread_id" '
+      type == "object" and .id == $id and
+      ((has("archived") | not) or ((.archived | type) == "boolean")) and
+      (.messages | type) == "array" and (.messages | length) == 0
+    ' "$exported" >/dev/null; then
+      echo "lookup-failed: invalid list-omitted thread export" >&2
+      exit 2
+    fi
+    if jq -e '.archived == true' "$exported" >/dev/null; then
+      echo archived
+      exit 0
+    fi
+    echo empty
+    exit 0
+    ;;
+  *)
+    usage
+    ;;
+esac

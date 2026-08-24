@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+finish="$root/bin/phase0b-finish"
+
+expect_failure() {
+  label=$1
+  shift
+  if "$@" >/dev/null 2>&1; then
+    echo "FAIL $label: unexpectedly succeeded" >&2
+    exit 1
+  fi
+  echo "PASS $label"
+}
+
+"$finish" verify a a a
+echo "PASS matching SHAs"
+expect_failure "sandbox/fetched SHA mismatch" "$finish" verify a b a
+expect_failure "sandbox/host-ref SHA mismatch" "$finish" verify a a b
+
+stub=$(mktemp -d)
+trap 'rm -rf "$stub"' EXIT
+cat >"$stub/thread" <<'EOF'
+#!/usr/bin/env bash
+touch "$STNT_THREAD_SENTINEL"
+echo "synthetic lookup failure" >&2
+exit 2
+EOF
+cat >"$stub/runtime" <<'EOF'
+#!/usr/bin/env bash
+touch "$STNT_RUNTIME_SENTINEL"
+echo "runtime must not be called after failed thread lookup" >&2
+exit 99
+EOF
+chmod +x "$stub/thread" "$stub/runtime"
+output="$stub/output"
+set +e
+env STNT_THREAD_ADAPTER="$stub/thread" STNT_RUNTIME="$stub/runtime" \
+  STNT_THREAD_SENTINEL="$stub/thread-called" \
+  STNT_RUNTIME_SENTINEL="$stub/runtime-called" "$finish" finish \
+  "synthetic-$$" /tmp T-00000000-0000-0000-0000-000000000000 \
+  branch preserved/branch >"$output" 2>&1
+status=$?
+set -e
+[[ $status -eq 1 ]] || {
+  echo "FAIL failed Amp lookup returned $status instead of 1" >&2
+  exit 1
+}
+grep -Fq "retain: Amp thread lookup failed or thread is unknown" "$output" || {
+  echo "FAIL failed Amp lookup did not emit the retention diagnostic" >&2
+  exit 1
+}
+[[ -e $stub/thread-called ]] || {
+  echo "FAIL failed Amp lookup did not call the thread adapter" >&2
+  exit 1
+}
+if [[ -e $stub/runtime-called ]]; then
+  echo "FAIL failed Amp lookup called the runtime" >&2
+  exit 1
+fi
+echo "PASS failed Amp lookup retains before runtime mutation"
+
+host="$stub/host"
+sandbox_repo="$stub/sandbox-repo"
+mkdir -p "$host"
+git -C "$host" init -b main >/dev/null
+git -C "$host" config user.name "Stnt Test"
+git -C "$host" config user.email "stnt@example.invalid"
+printf 'base\n' >"$host/README.md"
+git -C "$host" add README.md
+git -C "$host" commit -m base >/dev/null
+git clone -q "$host" "$sandbox_repo"
+git -C "$sandbox_repo" config user.name "Stnt Test"
+git -C "$sandbox_repo" config user.email "stnt@example.invalid"
+git -C "$sandbox_repo" switch -c feature/example-work >/dev/null
+printf 'work\n' >"$sandbox_repo/work.txt"
+git -C "$sandbox_repo" add work.txt
+git -C "$sandbox_repo" commit -m work >/dev/null
+work_sha=$(git -C "$sandbox_repo" rev-parse HEAD)
+git -C "$host" remote add sandbox-synthetic "$sandbox_repo"
+
+cat >"$stub/thread-archived" <<'EOF'
+#!/usr/bin/env bash
+echo archived
+EOF
+cat >"$stub/thread-must-not-run" <<'EOF'
+#!/usr/bin/env bash
+echo "detach must not inspect or mutate the Amp thread" >&2
+exit 99
+EOF
+cat >"$stub/runtime-git" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+command=$1
+shift
+case "$command" in
+  exec)
+    shift # sandbox name
+    if [[ $1 == true ]]; then
+      exit 0
+    fi
+    [[ $1 == bash && $2 == --noprofile && $3 == --norc && $4 == -c ]]
+    script=$5
+    shift 5
+    if [[ ${STNT_FAIL_BRANCH_INVENTORY:-} == 1 && $script == *for-each-ref* ]]; then
+      exit 88
+    fi
+    (cd "$STNT_SANDBOX_REPO" && bash --noprofile --norc -c "$script" "$@")
+    ;;
+  run|stop)
+    exit 0
+    ;;
+  remote)
+    echo sandbox-synthetic
+    ;;
+  remove)
+    git -C "$STNT_HOST_REPO" remote remove sandbox-synthetic
+    touch "$STNT_REMOVED_SENTINEL"
+    ;;
+  list)
+    [[ -e $STNT_REMOVED_SENTINEL ]]
+    echo '{"sandboxes":[]}'
+    ;;
+  *)
+    echo "unexpected runtime command: $command" >&2
+    exit 99
+    ;;
+esac
+EOF
+chmod +x "$stub/thread-archived" "$stub/thread-must-not-run" "$stub/runtime-git"
+
+env STNT_THREAD_ADAPTER="$stub/thread-archived" STNT_RUNTIME="$stub/runtime-git" \
+  STNT_SANDBOX_REPO="$sandbox_repo" STNT_HOST_REPO="$host" \
+  STNT_REMOVED_SENTINEL="$stub/removed" "$finish" finish \
+  synthetic-dynamic "$host" T-00000000-0000-0000-0000-000000000001 \
+  --current-branch preserved/dynamic >/dev/null
+[[ -e $stub/removed ]]
+[[ $(git -C "$host" rev-parse refs/heads/preserved/dynamic) == "$work_sha" ]]
+echo "PASS dynamic current branch is preserved without a generated work branch"
+
+rm -f "$stub/removed"
+git -C "$host" remote add sandbox-synthetic "$sandbox_repo"
+env STNT_THREAD_ADAPTER="$stub/thread-must-not-run" STNT_RUNTIME="$stub/runtime-git" \
+  STNT_SANDBOX_REPO="$sandbox_repo" STNT_HOST_REPO="$host" \
+  STNT_REMOVED_SENTINEL="$stub/removed" "$finish" detach \
+  synthetic-detach "$host" W-00000000-0000-0000-0000-000000000004 \
+  --current-branch preserved/detached-active >/dev/null
+[[ -e $stub/removed ]]
+[[ $(git -C "$host" rev-parse refs/heads/preserved/detached-active) == "$work_sha" ]]
+echo "PASS workspace detach preserves and removes without invoking the Amp adapter"
+
+rm -f "$stub/removed"
+git -C "$host" remote add sandbox-synthetic "$sandbox_repo"
+printf 'uncommitted\n' >"$sandbox_repo/uncommitted.txt"
+detach_output="$stub/detach-output"
+set +e
+env STNT_THREAD_ADAPTER="$stub/thread-must-not-run" STNT_RUNTIME="$stub/runtime-git" \
+  STNT_SANDBOX_REPO="$sandbox_repo" STNT_HOST_REPO="$host" \
+  STNT_REMOVED_SENTINEL="$stub/removed" "$finish" detach \
+  synthetic-detach-dirty "$host" T-00000000-0000-0000-0000-000000000005 \
+  --current-branch preserved/detached-dirty >"$detach_output" 2>&1
+detach_status=$?
+set -e
+[[ $detach_status -eq 1 ]]
+[[ ! -e $stub/removed ]]
+grep -Fq "recover: $finish 'detach' 'synthetic-detach-dirty'" "$detach_output"
+if git -C "$host" rev-parse --verify refs/heads/preserved/detached-dirty >/dev/null 2>&1; then
+  echo "FAIL dirty detach created a preservation ref" >&2
+  exit 1
+fi
+rm "$sandbox_repo/uncommitted.txt"
+echo "PASS dirty detach retains with an exact detach recovery command"
+
+rm -f "$stub/removed"
+git -C "$sandbox_repo" switch -c divergent main >/dev/null
+printf 'divergent\n' >"$sandbox_repo/divergent.txt"
+git -C "$sandbox_repo" add divergent.txt
+git -C "$sandbox_repo" commit -m divergent >/dev/null
+git -C "$sandbox_repo" switch feature/example-work >/dev/null
+expect_failure "divergent sandbox branch retains before removal" env \
+  STNT_THREAD_ADAPTER="$stub/thread-archived" STNT_RUNTIME="$stub/runtime-git" \
+  STNT_SANDBOX_REPO="$sandbox_repo" STNT_HOST_REPO="$host" \
+  STNT_REMOVED_SENTINEL="$stub/removed" "$finish" finish \
+  synthetic-divergent "$host" T-00000000-0000-0000-0000-000000000002 \
+  --current-branch preserved/divergent
+[[ ! -e $stub/removed ]]
+if git -C "$host" rev-parse --verify refs/heads/preserved/divergent >/dev/null 2>&1; then
+  echo "FAIL divergent sandbox branch created a preservation ref" >&2
+  exit 1
+fi
+
+git -C "$sandbox_repo" branch -D divergent >/dev/null
+expect_failure "failed branch inventory retains before preservation and removal" env \
+  STNT_THREAD_ADAPTER="$stub/thread-archived" STNT_RUNTIME="$stub/runtime-git" \
+  STNT_SANDBOX_REPO="$sandbox_repo" STNT_HOST_REPO="$host" \
+  STNT_REMOVED_SENTINEL="$stub/removed" STNT_FAIL_BRANCH_INVENTORY=1 \
+  "$finish" finish synthetic-inventory "$host" \
+  T-00000000-0000-0000-0000-000000000003 \
+  --current-branch preserved/inventory-failure
+[[ ! -e $stub/removed ]]
+if git -C "$host" rev-parse --verify refs/heads/preserved/inventory-failure >/dev/null 2>&1; then
+  echo "FAIL failed branch inventory created a preservation ref" >&2
+  exit 1
+fi

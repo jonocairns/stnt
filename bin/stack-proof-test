@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runtime="$root/bin/docker-sandbox"
+finish="$root/bin/stack-finish"
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/stnt-stack-proof.XXXXXX")
+suffix=$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)
+sandbox_a="stnt-stack-proof-a-$suffix"
+sandbox_b="stnt-stack-proof-b-$suffix"
+safe_a=false
+safe_b=false
+complete=false
+
+cleanup() {
+  if [[ $complete == true ]]; then
+    rm -rf "$temporary"
+    return
+  fi
+  echo "stack proof interrupted; retaining unverified resources:" >&2
+  echo "  $sandbox_a" >&2
+  echo "  $sandbox_b" >&2
+  echo "  $temporary" >&2
+}
+trap cleanup EXIT
+
+frontend="$temporary/frontend"
+backend="$temporary/backend"
+mkdir "$frontend" "$backend"
+cp "$root/tests/fixtures/stack/frontend.py" "$frontend/frontend.py"
+cp "$root/tests/fixtures/stack/backend.py" "$backend/backend.py"
+for repository in "$frontend" "$backend"; do
+  git -C "$repository" init -q -b main
+  git -C "$repository" add .
+  git -C "$repository" -c user.name='Stnt Stack Proof' \
+    -c user.email=stnt@example.invalid commit -qm fixture
+done
+frontend_sha=$(git -C "$frontend" rev-parse HEAD)
+backend_sha=$(git -C "$backend" rev-parse HEAD)
+read -r port_a port_b < <(python3 - <<'PY'
+import socket
+sockets = [socket.socket() for _ in range(2)]
+for item in sockets:
+    item.bind(("127.0.0.1", 0))
+print(*(item.getsockname()[1] for item in sockets))
+for item in sockets:
+    item.close()
+PY
+)
+
+create_stack() {
+  local sandbox=$1 name=$2 host_port=$3
+  local private_backend="/home/agent/stnt-stacks/$name/backend"
+  "$runtime" create-stack "$sandbox" "$frontend" "$backend"
+  "$runtime" exec "$sandbox" true
+  "$runtime" publish "$sandbox" "$host_port:8000"
+  "$runtime" stack-prepare "$sandbox" "$frontend" main "$frontend_sha" \
+    "$backend" "$private_backend" main "$backend_sha"
+  "$runtime" stack-start "$sandbox" "$name" "$frontend" "$private_backend" \
+    '["python3","frontend.py"]' '["python3","backend.py"]'
+}
+
+wait_http() {
+  local port=$1 expected=$2
+  for _ in $(seq 1 100); do
+    body=$(curl -fsS "http://127.0.0.1:$port/api/proof" 2>/dev/null || true)
+    [[ $body == *"\"stack\": \"$expected\""* ]] && return
+    sleep 0.2
+  done
+  echo "HTTP proof failed for $expected on $port" >&2
+  return 1
+}
+
+check_websocket() {
+  python3 - "$1" "$2" <<'PY'
+import base64, json, os, socket, struct, sys
+port, expected = int(sys.argv[1]), sys.argv[2]
+sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+key = base64.b64encode(os.urandom(16)).decode()
+sock.sendall((f"GET /ws/proof HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+response = b""
+while b"\r\n\r\n" not in response:
+    response += sock.recv(4096)
+headers, buffered = response.split(b"\r\n\r\n", 1)
+assert b" 101 " in headers
+payload = b"hello"
+mask = os.urandom(4)
+sock.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(value ^ mask[index % 4] for index, value in enumerate(payload)))
+def read(length):
+    global buffered
+    while len(buffered) < length:
+        buffered += sock.recv(4096)
+    value, buffered = buffered[:length], buffered[length:]
+    return value
+first, second = read(2)
+length = second & 0x7f
+if length == 126: length = struct.unpack("!H", read(2))[0]
+elif length == 127: length = struct.unpack("!Q", read(8))[0]
+message = json.loads(read(length))
+assert first & 0x0f == 1
+assert message == {"stack": expected, "transport": "websocket", "message": "hello"}, message
+sock.close()
+PY
+}
+
+commit_stack_work() {
+  local sandbox=$1 name=$2 marker=$3
+  local private_backend="/home/agent/stnt-stacks/$name/backend"
+  "$runtime" project-exec "$sandbox" "$frontend" bash --noprofile --norc -c '
+    set -euo pipefail
+    printf "%s\n" "$1" >"frontend-$1.txt"
+    git add "frontend-$1.txt"
+    git -c user.name="Stnt Stack Proof" -c user.email=stnt@example.invalid commit -qm "$1 frontend work"
+  ' stnt-stack-work "$marker"
+  "$runtime" project-exec "$sandbox" "$private_backend" bash --noprofile --norc -c '
+    set -euo pipefail
+    printf "%s\n" "$1" >"backend-$1.txt"
+    git add "backend-$1.txt"
+    git -c user.name="Stnt Stack Proof" -c user.email=stnt@example.invalid commit -qm "$1 backend work"
+  ' stnt-stack-work "$marker"
+}
+
+clone_sha() {
+  "$runtime" stack-git-state "$1" "$2" | sed -n '2p'
+}
+
+create_stack "$sandbox_a" proof-a "$port_a"
+create_stack "$sandbox_b" proof-b "$port_b"
+
+[[ $port_a != "$port_b" ]]
+wait_http "$port_a" proof-a
+wait_http "$port_b" proof-b
+check_websocket "$port_a" proof-a
+check_websocket "$port_b" proof-b
+for _ in 1 2 3; do
+  wait_http "$port_a" proof-a
+  wait_http "$port_b" proof-b
+done
+# Clone mode also owns its generated host Git-preservation bridge on 9418.
+# The ingress is the only published application port; backend ports stay private.
+jq -e '([.[].sandbox_port] | unique | sort) == [8000, 9418]' < <("$runtime" ports "$sandbox_a") >/dev/null
+jq -e '([.[].sandbox_port] | unique | sort) == [8000, 9418]' < <("$runtime" ports "$sandbox_b") >/dev/null
+
+"$runtime" stop "$sandbox_a"
+"$runtime" exec "$sandbox_a" true
+jq -e --argjson port "$port_a" '.host_port == $port and .sandbox_port == 8000' \
+  < <("$runtime" port "$sandbox_a" 8000) >/dev/null
+"$runtime" stack-verify "$sandbox_a" "$frontend" main "$frontend_sha" \
+  /home/agent/stnt-stacks/proof-a/backend main "$backend_sha"
+"$runtime" stack-start "$sandbox_a" proof-a "$frontend" \
+  /home/agent/stnt-stacks/proof-a/backend '["python3","frontend.py"]' '["python3","backend.py"]'
+wait_http "$port_a" proof-a
+check_websocket "$port_a" proof-a
+wait_http "$port_b" proof-b
+
+commit_stack_work "$sandbox_a" proof-a proof-a
+commit_stack_work "$sandbox_b" proof-b proof-b
+frontend_a_sha=$(clone_sha "$sandbox_a" "$frontend")
+backend_a_sha=$(clone_sha "$sandbox_a" /home/agent/stnt-stacks/proof-a/backend)
+frontend_b_sha=$(clone_sha "$sandbox_b" "$frontend")
+backend_b_sha=$(clone_sha "$sandbox_b" /home/agent/stnt-stacks/proof-b/backend)
+[[ $frontend_a_sha != "$frontend_b_sha" && $backend_a_sha != "$backend_b_sha" ]]
+safe_a=true
+safe_b=true
+
+[[ $safe_a == true && $safe_b == true ]]
+"$finish" detach "$sandbox_a" proof-a T-00000000-0000-0000-0000-000000000001 \
+  "$frontend" "$frontend" stnt-preserved/stack-proof-a-frontend \
+  "$backend" /home/agent/stnt-stacks/proof-a/backend stnt-preserved/stack-proof-a-backend
+"$finish" detach "$sandbox_b" proof-b T-00000000-0000-0000-0000-000000000002 \
+  "$frontend" "$frontend" stnt-preserved/stack-proof-b-frontend \
+  "$backend" /home/agent/stnt-stacks/proof-b/backend stnt-preserved/stack-proof-b-backend
+[[ $(git -C "$frontend" rev-parse refs/heads/stnt-preserved/stack-proof-a-frontend) == "$frontend_a_sha" ]]
+[[ $(git -C "$backend" rev-parse refs/heads/stnt-preserved/stack-proof-a-backend) == "$backend_a_sha" ]]
+[[ $(git -C "$frontend" rev-parse refs/heads/stnt-preserved/stack-proof-b-frontend) == "$frontend_b_sha" ]]
+[[ $(git -C "$backend" rev-parse refs/heads/stnt-preserved/stack-proof-b-backend) == "$backend_b_sha" ]]
+git -C "$frontend" cat-file -e "$frontend_a_sha^{commit}"
+git -C "$frontend" cat-file -e "$frontend_b_sha^{commit}"
+git -C "$backend" cat-file -e "$backend_a_sha^{commit}"
+git -C "$backend" cat-file -e "$backend_b_sha^{commit}"
+complete=true
+printf 'stack-proof=pass hostPorts=%s,%s internalPorts=8000,4000,4500 isolation=pass resume=pass preservation=both-repositories\n' "$port_a" "$port_b"

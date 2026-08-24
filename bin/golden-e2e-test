@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+stnt="$root/bin/stnt"
+runtime="$root/bin/docker-sandbox"
+
+if [[ ${STNT_RUN_LIVE_GOLDEN:-} != 1 || $# -ne 1 || $1 != /* ]]; then
+  echo "usage: STNT_RUN_LIVE_GOLDEN=1 $0 /absolute/path/to/repository" >&2
+  echo "Creates one guest-TUI workspace, exercises two guest-native Amp threads, pushes their branch, and destructively finishes it." >&2
+  exit 2
+fi
+
+repository=$(git -C "$1" rev-parse --show-toplevel)
+[[ $repository == "$1" && -d $repository/.git ]]
+[[ -z $(git -C "$repository" status --porcelain=v1 --untracked-files=all) ]]
+command -v gh >/dev/null
+
+host_head=$(git -C "$repository" rev-parse --verify HEAD^{commit})
+host_branch=$(git -C "$repository" symbolic-ref --quiet --short HEAD)
+host_origin=$(git -C "$repository" config --get remote.origin.url)
+profile=$(cd "$repository" && "$stnt" config show)
+github_repository=$(
+  /usr/bin/python3 -c '
+import json, re, sys
+profile = json.load(sys.stdin)
+remote = profile.get("repository", {}).get("remote")
+services = profile.get("services")
+capabilities = profile.get("secretCapabilities")
+drift = profile.get("drift")
+if not isinstance(remote, str) or not re.fullmatch(
+    r"github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", remote
+):
+    raise SystemExit("golden proof requires an exact reviewed GitHub repository")
+if not isinstance(services, list) or len(services) > 1:
+    raise SystemExit("golden proof requires zero or one reviewed service")
+if not isinstance(capabilities, list) or not any(
+    isinstance(item, dict)
+    and item.get("name") == "github-read-write"
+    and item.get("provider") == "docker-sandboxes"
+    and item.get("consumer") == "git"
+    and item.get("lifetime") == "workspace"
+    for item in capabilities
+):
+    raise SystemExit("golden proof requires the reviewed workspace-scoped GitHub Git capability")
+if not isinstance(drift, dict) or any(value != "unchanged" for value in drift.values()):
+    raise SystemExit("golden proof requires an unchanged reviewed repository profile")
+print(remote.removeprefix("github.com/"))
+' <<<"$profile"
+)
+
+temporary=$(mktemp -d)
+timings="$temporary/timings.jsonl"
+phase="$temporary/tui-phase"
+guest_threads="$temporary/guest-threads"
+finish_transcript="$temporary/finish-transcript"
+workspace_id=
+sandbox=
+preservation=
+state_path=
+before=
+work_branch=
+remote_ref=
+remote_cleanup_needed=false
+workspace_removed=false
+
+cleanup_remote_branch() {
+  [[ $remote_cleanup_needed == true && -n $github_repository && -n $work_branch ]] || return 0
+  encoded_branch=$(
+    /usr/bin/python3 - "$work_branch" <<'PY'
+import sys, urllib.parse
+print(urllib.parse.quote(sys.argv[1], safe=""))
+PY
+  )
+  if gh api --method DELETE \
+    "repos/$github_repository/git/refs/heads/$encoded_branch" >/dev/null; then
+    remote_cleanup_needed=false
+    return 0
+  fi
+  return 1
+}
+
+recover() {
+  status=$?
+  if [[ $status -ne 0 ]]; then
+    set +e
+    if [[ -n $state_path && ! -e $state_path ]]; then
+      workspace_removed=true
+    fi
+    if [[ -z $workspace_id && -n $before && -f $before ]]; then
+      session=$(
+        /usr/bin/python3 - "$repository" "$before" <<'PY'
+import json, os, pathlib, sys
+repository, before_path = sys.argv[1:]
+before = set(pathlib.Path(before_path).read_text().splitlines())
+home = pathlib.Path(os.environ.get("STNT_STATE_HOME", pathlib.Path.home() / "Library/Application Support/stnt"))
+matches = []
+for path in (home / "sessions").glob("*.json"):
+    value = json.loads(path.read_text())
+    workspace = value.get("workspaceID")
+    if value.get("repositoryPath") == repository and workspace and workspace not in before:
+        matches.append((path, value))
+if len(matches) == 1:
+    path, value = matches[0]
+    for item in (value["workspaceID"], value["sandbox"], value["preservationBranch"], str(path)):
+        print(item)
+PY
+      )
+      workspace_id=$(printf '%s\n' "$session" | sed -n '1p')
+      sandbox=$(printf '%s\n' "$session" | sed -n '2p')
+      preservation=$(printf '%s\n' "$session" | sed -n '3p')
+      state_path=$(printf '%s\n' "$session" | sed -n '4p')
+    fi
+    if ! cleanup_remote_branch; then
+      echo "remote proof branch may remain: $work_branch" >&2
+      echo "remove after inspection: gh api --method DELETE repos/$github_repository/git/refs/heads/<URL-encoded-branch>" >&2
+    fi
+    if [[ $workspace_removed == true ]]; then
+      echo "GOLDEN E2E FAILED after destructive workspace removal" >&2
+    else
+      echo "GOLDEN E2E RETAINED after failure" >&2
+    fi
+    echo "repository=$repository" >&2
+    [[ -n $workspace_id ]] && echo "workspace=$workspace_id" >&2
+    [[ -n $sandbox ]] && echo "sandbox=$sandbox" >&2
+    [[ -s $guest_threads ]] && sed 's/^/guestThread=/' "$guest_threads" >&2
+    [[ -n $preservation ]] && echo "preservationBranch=$preservation" >&2
+    [[ -n $work_branch ]] && echo "proofBranch=$work_branch" >&2
+    [[ -n $state_path ]] && echo "state=$state_path" >&2
+    if [[ $workspace_removed != true ]]; then
+      [[ -n $workspace_id ]] && echo "retry start: $stnt --session $workspace_id start" >&2
+      [[ -n $workspace_id ]] && echo "preserve/remove: $stnt --session $workspace_id detach" >&2
+      [[ -n $sandbox ]] && echo "service log: $runtime exec $sandbox cat /tmp/stnt-service.log" >&2
+    fi
+    echo "timings=$timings" >&2
+    trap - EXIT
+    exit "$status"
+  fi
+  rm -rf "$temporary"
+}
+trap recover EXIT HUP INT TERM
+
+# The production Stnt path still invokes tui-start. This adapter replaces only
+# the terminal interaction with guest-local execute turns so the proof is
+# deterministic and noninteractive; thread creation, transcripts, tools, and
+# filesystem access all remain inside the real retained sandbox.
+cat >"$temporary/runtime" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+command=${1:-}
+if [[ $command != tui-start ]]; then
+  exec "$GOLDEN_REAL_RUNTIME" "$@"
+fi
+shift
+[[ $# -eq 2 || $# -eq 3 ]]
+sandbox=$1
+repository=$2
+workspace=$(basename "$GOLDEN_REPOSITORY")
+marker_prefix=.stnt-golden-e2e
+
+guest() {
+  "$GOLDEN_REAL_RUNTIME" exec "$sandbox" bash --noprofile --norc -c '
+    set -euo pipefail
+    cd "$1"
+    shift
+    exec /home/agent/.local/bin/amp --dangerously-allow-all "$@"
+  ' stnt-golden "$repository" "${@:1}"
+}
+
+execute_thread() {
+  thread=$1
+  prompt=$2
+  guest --no-archive-after-execute --execute "$prompt" threads continue "$thread"
+}
+
+if [[ ! -e $GOLDEN_PHASE ]]; then
+  thread_one=$(guest threads new | tail -n 1)
+  thread_two=$(guest threads new | tail -n 1)
+  [[ $thread_one =~ ^T-[0-9a-f-]{36}$ && $thread_two =~ ^T-[0-9a-f-]{36}$ && $thread_one != "$thread_two" ]]
+  printf '%s\n%s\n' "$thread_one" "$thread_two" >"$GOLDEN_GUEST_THREADS"
+  execute_thread "$thread_one" "Use shell_command to work only in the current repository. Create a branch named stnt/golden-${thread_one:2:8}, create ${marker_prefix}-one.txt containing workspace=${workspace} and thread=${thread_one}, stage that marker plus an already-modified .pnp.cjs if and only if it is the sole pre-existing change, and commit with message 'Golden guest thread one'. Leave the clone clean."
+  execute_thread "$thread_two" "Use shell_command to work only in the current repository and keep its current branch. Create ${marker_prefix}-two.txt containing workspace=${workspace} and thread=${thread_two}, stage only that marker, and commit with message 'Golden guest thread two'. Leave the clone clean."
+  : >"$GOLDEN_PHASE"
+else
+  thread_one=$(sed -n '1p' "$GOLDEN_GUEST_THREADS")
+  thread_two=$(sed -n '2p' "$GOLDEN_GUEST_THREADS")
+  [[ -n $thread_one && -n $thread_two && -z $(sed -n '3p' "$GOLDEN_GUEST_THREADS") ]]
+  execute_thread "$thread_two" "Using shell_command in the current repository, verify ${marker_prefix}-one.txt and ${marker_prefix}-two.txt exist, create ${marker_prefix}-resumed.txt containing resumed-thread=${thread_two}, stage only that marker, and commit with message 'Golden guest resume'. Leave the clone clean."
+fi
+EOF
+chmod 700 "$temporary/runtime"
+
+export GOLDEN_REAL_RUNTIME="$runtime"
+export GOLDEN_REPOSITORY="$repository"
+export GOLDEN_PHASE="$phase"
+export GOLDEN_GUEST_THREADS="$guest_threads"
+export STNT_RUNTIME="$temporary/runtime"
+
+before=$(mktemp "$temporary/before.XXXXXX")
+/usr/bin/python3 - "$repository" >"$before" <<'PY'
+import json, os, pathlib, sys
+home = pathlib.Path(os.environ.get("STNT_STATE_HOME", pathlib.Path.home() / "Library/Application Support/stnt"))
+for path in (home / "sessions").glob("*.json"):
+    value = json.loads(path.read_text())
+    if value.get("repositoryPath") == sys.argv[1] and value.get("workspaceID"):
+        print(value["workspaceID"])
+PY
+
+echo "GOLDEN stage=create/guest-threads/private-clone-work"
+(cd "$repository" && "$stnt" --timings "$timings" new --from "$host_branch")
+
+session=$(
+  /usr/bin/python3 - "$repository" "$before" <<'PY'
+import json, os, pathlib, sys
+repository, before_path = sys.argv[1:]
+before = set(pathlib.Path(before_path).read_text().splitlines())
+home = pathlib.Path(os.environ.get("STNT_STATE_HOME", pathlib.Path.home() / "Library/Application Support/stnt"))
+matches = []
+for path in (home / "sessions").glob("*.json"):
+    value = json.loads(path.read_text())
+    workspace = value.get("workspaceID")
+    if value.get("repositoryPath") == repository and workspace and workspace not in before:
+        matches.append((path, value))
+if len(matches) != 1:
+    raise SystemExit("expected exactly one newly created workspace")
+path, value = matches[0]
+if value.get("lifecycleOwner") != "workspace" or "threadID" in value:
+    raise SystemExit("new workspace unexpectedly depends on a host Amp thread")
+git_remote = value.get("profilePlan", {}).get("gitRemote")
+if not isinstance(git_remote, dict) or not isinstance(git_remote.get("normalized"), str):
+    raise SystemExit("golden proof requires a reviewed GitHub read/write capability")
+for item in (
+    value["workspaceID"], value["sandbox"], value["preservationBranch"], str(path),
+    git_remote["normalized"],
+):
+    print(item)
+PY
+)
+workspace_id=$(printf '%s\n' "$session" | sed -n '1p')
+sandbox=$(printf '%s\n' "$session" | sed -n '2p')
+preservation=$(printf '%s\n' "$session" | sed -n '3p')
+state_path=$(printf '%s\n' "$session" | sed -n '4p')
+normalized_remote=$(printf '%s\n' "$session" | sed -n '5p')
+[[ $normalized_remote =~ ^github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+[[ ${normalized_remote#github.com/} == "$github_repository" ]]
+thread_one=$(sed -n '1p' "$guest_threads")
+thread_two=$(sed -n '2p' "$guest_threads")
+[[ -n $thread_one && -n $thread_two && $thread_one != "$thread_two" && -z $(sed -n '3p' "$guest_threads") ]]
+
+echo "GOLDEN stage=guest-transcripts/editor/pause"
+for thread in "$thread_one" "$thread_two"; do
+  "$runtime" exec "$sandbox" bash --noprofile --norc -c '
+    export_json=$(/home/agent/.local/bin/amp threads export "$1")
+    jq -e --arg id "$1" ".id == \$id and (.messages | length) > 0" <<<"$export_json" >/dev/null
+  ' stnt-golden "$thread"
+done
+(cd "$repository" && "$stnt" --timings "$timings" --session "$workspace_id" editor)
+(cd "$repository" && "$stnt" --timings "$timings" --session "$workspace_id" pause)
+
+echo "GOLDEN stage=warm-resume/guest-thread/private-clone-verification"
+(cd "$repository" && "$stnt" --timings "$timings" --session "$workspace_id" start)
+
+work_state=$(
+  "$runtime" exec "$sandbox" bash --noprofile --norc -c '
+    set -euo pipefail
+    cd "$1"
+    test -f .stnt-golden-e2e-one.txt
+    test -f .stnt-golden-e2e-two.txt
+    test -f .stnt-golden-e2e-resumed.txt
+    [[ -z $(git status --porcelain=v1 --untracked-files=all) ]]
+    git symbolic-ref --quiet --short HEAD
+    git rev-parse --verify HEAD^{commit}
+  ' stnt-golden "$repository"
+)
+work_branch=$(printf '%s\n' "$work_state" | sed -n '1p')
+work_sha=$(printf '%s\n' "$work_state" | sed -n '2p')
+[[ -n $work_branch && $work_branch == stnt/golden-* && $work_sha =~ ^[0-9a-f]{40}$ ]]
+remote_ref="refs/heads/$work_branch"
+"$runtime" exec "$sandbox" bash --noprofile --norc -c '
+  export_json=$(/home/agent/.local/bin/amp threads export "$1")
+  jq -e --arg id "$1" ".id == \$id and (.messages | length) >= 4" <<<"$export_json" >/dev/null
+' stnt-golden "$thread_two"
+
+echo "GOLDEN stage=push/upstream"
+set +e
+"$runtime" exec "$sandbox" git -C "$repository" ls-remote --exit-code origin "$remote_ref" >/dev/null 2>&1
+remote_status=$?
+set -e
+[[ $remote_status -eq 2 ]]
+remote_cleanup_needed=true
+"$runtime" exec "$sandbox" git -C "$repository" push --set-upstream origin "HEAD:$remote_ref"
+remote_state=$(
+  "$runtime" exec "$sandbox" bash --noprofile --norc -c '
+    set -euo pipefail
+    branch=$1
+    ref=$2
+    expected=$3
+    repository=$4
+    cd "$repository"
+    [[ $(git symbolic-ref --quiet --short HEAD) == "$branch" ]]
+    [[ $(git rev-parse --abbrev-ref --symbolic-full-name "@{upstream}") == "origin/$branch" ]]
+    read -r behind ahead < <(git rev-list --left-right --count "@{upstream}...HEAD")
+    [[ $ahead == 0 && $behind == 0 ]]
+    read -r remote_sha _ < <(git ls-remote --exit-code origin "$ref")
+    [[ $remote_sha == "$expected" ]]
+    printf "%s\n%s\n%s\n" "$remote_sha" "$ahead" "$behind"
+  ' stnt-golden "$work_branch" "$remote_ref" "$work_sha" "$repository"
+)
+[[ $(printf '%s\n' "$remote_state" | sed -n '1p') == "$work_sha" ]]
+[[ $(printf '%s\n' "$remote_state" | sed -n '2p') == 0 ]]
+[[ $(printf '%s\n' "$remote_state" | sed -n '3p') == 0 ]]
+"$runtime" stop "$sandbox"
+
+echo "GOLDEN stage=destructive-finish"
+printf 'finish %s\n' "$workspace_id" |
+  (cd "$repository" && /usr/bin/script -q "$finish_transcript" \
+    "$stnt" --timings "$timings" --session "$workspace_id" finish)
+if [[ ! -e $state_path ]]; then
+  workspace_removed=true
+fi
+grep -F "Branch: $work_branch" "$finish_transcript" >/dev/null
+grep -F "Upstream: origin/$work_branch; 0 commits not on upstream, 0 commits behind." \
+  "$finish_transcript" >/dev/null
+grep -F "finished $workspace_id; permanently removed sandbox and workspace state" \
+  "$finish_transcript" >/dev/null
+
+[[ ! -e $state_path ]]
+[[ -z $("$runtime" find "$sandbox") ]]
+[[ -z $(git -C "$repository" for-each-ref --format='%(refname)' "refs/stnt/fetch/$sandbox") ]]
+! git -C "$repository" remote | grep -Fx "sandbox-$sandbox" >/dev/null
+! git -C "$repository" rev-parse --verify "refs/heads/$preservation^{commit}" >/dev/null 2>&1
+[[ $(git -C "$repository" rev-parse --verify HEAD^{commit}) == "$host_head" ]]
+[[ $(git -C "$repository" symbolic-ref --quiet --short HEAD) == "$host_branch" ]]
+[[ $(git -C "$repository" config --get remote.origin.url) == "$host_origin" ]]
+[[ -z $(git -C "$repository" status --porcelain=v1 --untracked-files=all) ]]
+
+cleanup_remote_branch
+set +e
+git -C "$repository" ls-remote --exit-code origin "$remote_ref" >/dev/null 2>&1
+remote_status=$?
+set -e
+[[ $remote_status -eq 2 ]]
+
+echo "GOLDEN PASS workspace=$workspace_id guestThreads=$thread_one,$thread_two sandbox=$sandbox pushedAndRemovedBranch=$work_branch sha=$work_sha destructiveFinish=verified"
+cat "$timings"

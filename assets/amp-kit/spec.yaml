@@ -1,0 +1,51 @@
+# Adapted from docker/sbx-kits-contrib's Amp kit at commit
+# ef2cc23ae634498161404953796f531bd540c8ad and modified for Stnt.
+# See the repository LICENSE and NOTICE files for licensing and attribution.
+schemaVersion: "2"
+kind: sandbox
+name: amp
+displayName: Amp
+description: Reviewed local Amp kit for isolated Stnt development sessions.
+
+sandbox:
+  image: "docker/sandbox-templates:shell-docker"
+  entrypoint: [amp]
+
+permissions:
+  network:
+    allow:
+    - "ampcode.com:443"
+    - "*.ampcode.com:443"
+
+credentials:
+  - service: amp
+    apiKey:
+      name: ""
+      inject:
+        - domain: ampcode.com
+          header: Authorization
+          format: "Bearer %s"
+
+setup:
+  install:
+    - command: "curl -fsSL https://ampcode.com/install.sh | AMP_VERSION=0.0.1787083307-g3b8169 bash"
+      user: "1000"
+      description: Install the host-tested Amp CLI version
+
+agentInstructions:
+  filename: AGENTS.md
+  content: |
+    ## Stnt sandbox environment
+
+    You are running inside an isolated, retained Docker sandbox. The current
+    workspace is a sandbox-private writable Git clone. Docker intentionally gives
+    it the same absolute path as the host repository, but that path resolves
+    inside the sandbox VM and is not the host checkout.
+
+    Whenever you describe the repository location or working tree, call it the
+    "sandbox-private clone" and explicitly say that its path is mirrored from the
+    host. Never describe it as the host checkout. Changes in this workspace stay
+    in this private clone until Stnt explicitly preserves them through Git.
+
+    The host repository is separately visible at `/run/sandbox/source` only as a
+    read-only source mount. Do not access or import host credentials.

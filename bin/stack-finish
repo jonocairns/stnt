@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runtime=${STNT_RUNTIME:-$root/bin/docker-sandbox}
+thread_adapter=${STNT_THREAD_ADAPTER:-$root/bin/amp-thread}
+
+usage() {
+  echo "usage: $0 {finish|detach} <sandbox> <stack> <thread-id> <frontend-host> <frontend-guest> <frontend-preservation-branch> <backend-host> <backend-guest> <backend-preservation-branch>" >&2
+  exit 2
+}
+
+[[ $# -eq 10 ]] || usage
+operation=$1
+sandbox=$2
+stack_name=$3
+thread_id=$4
+frontend_host=$5
+frontend_guest=$6
+frontend_branch=$7
+backend_host=$8
+backend_guest=$9
+backend_branch=${10}
+frontend_host_ref="refs/heads/$frontend_branch"
+backend_host_ref="refs/heads/$backend_branch"
+zero=0000000000000000000000000000000000000000
+started=false
+phase=pre-remove
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/stnt-stack-finish.XXXXXX")
+
+[[ $operation == finish || $operation == detach ]] || usage
+[[ $sandbox =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
+[[ $stack_name =~ ^[a-z][a-z0-9-]{0,31}$ ]] || usage
+[[ $thread_id =~ ^T-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$ ]] || usage
+[[ $frontend_host == /* && $frontend_guest == /* && $backend_host == /* && $backend_guest == /* ]] || usage
+[[ $frontend_host != "$backend_host" && $frontend_guest != "$backend_guest" ]] || usage
+git check-ref-format "$frontend_host_ref" || usage
+git check-ref-format "$backend_host_ref" || usage
+
+lock_root="$root/state/locks"
+mkdir -p "$lock_root"
+chmod 700 "$lock_root"
+lock="$lock_root/stack-finish-$sandbox.lock"
+if ! mkdir "$lock" 2>/dev/null; then
+  echo "retain: another removal operation holds $lock" >&2
+  exit 1
+fi
+
+cleanup() {
+  rm -rf "$temporary"
+  rmdir "$lock" 2>/dev/null || true
+}
+
+retry_command() {
+  printf "%q " "$0" "$operation" "$sandbox" "$stack_name" "$thread_id" \
+    "$frontend_host" "$frontend_guest" "$frontend_branch" \
+    "$backend_host" "$backend_guest" "$backend_branch"
+  printf "\n"
+}
+
+retain() {
+  local reason=$1
+  if [[ $started == true ]]; then
+    "$runtime" stop "$sandbox" >/dev/null 2>&1 || true
+  fi
+  echo "retain: stack $stack_name and sandbox $sandbox: $reason" >&2
+  echo "preservation branches: frontend=$frontend_branch backend=$backend_branch" >&2
+  echo "recover: $(retry_command)" >&2
+  exit 1
+}
+
+verify_host_ref() {
+  local repository=$1 host_ref=$2 expected_sha=$3
+  local actual_sha
+  actual_sha=$(git -C "$repository" rev-parse --verify "$host_ref^{commit}") || return 1
+  [[ $actual_sha == "$expected_sha" ]] || return 1
+  git -C "$repository" cat-file -e "$actual_sha^{commit}" || return 1
+  git -C "$repository" merge-base --is-ancestor "$expected_sha" "$host_ref"
+}
+
+indeterminate() {
+  local reason=$1
+  echo "removal outcome unknown for stack $stack_name and sandbox $sandbox: $reason" >&2
+  echo "preservation branches: frontend=$frontend_branch backend=$backend_branch" >&2
+  echo "verify: $runtime list" >&2
+  echo "verify: git -C '$frontend_host' rev-parse --verify '$frontend_host_ref^{commit}'" >&2
+  echo "verify: git -C '$backend_host' rev-parse --verify '$backend_host_ref^{commit}'" >&2
+  exit 2
+}
+
+interrupted() {
+  if [[ $phase == pre-remove ]]; then
+    retain "$operation interrupted before removal"
+  fi
+  indeterminate "$operation interrupted after removal began"
+}
+
+assert_thread_state() {
+  [[ $operation == finish ]] || return 0
+  local thread_state
+  thread_state=$("$thread_adapter" status "$thread_id") ||
+    retain "Amp thread lookup failed or thread is unknown"
+  [[ $thread_state == archived ]] ||
+    retain "Amp thread is not archived (state=$thread_state)"
+}
+
+read_clone_state() {
+  local guest=$1 output ref sha line_count
+  output=$("$runtime" stack-git-state "$sandbox" "$guest") ||
+    retain "private clone is dirty, detached, divergent, or unavailable: $guest"
+  line_count=$(printf '%s\n' "$output" | wc -l | tr -d ' ')
+  ref=$(printf '%s\n' "$output" | sed -n '1p')
+  sha=$(printf '%s\n' "$output" | sed -n '2p')
+  [[ $line_count == 2 && $ref == refs/heads/* && $sha =~ ^[0-9a-f]{40}$ ]] ||
+    retain "private clone returned malformed Git state: $guest"
+  observed_ref=$ref
+  observed_sha=$sha
+}
+
+create_or_verify_anchor() {
+  local repository=$1 host_ref=$2 sha=$3 existing_sha
+  if existing_sha=$(git -C "$repository" rev-parse --verify "$host_ref^{commit}" 2>/dev/null); then
+    [[ $existing_sha == "$sha" ]] ||
+      retain "host ref already exists at another SHA ($host_ref=$existing_sha)"
+  else
+    git -C "$repository" update-ref "$host_ref" "$sha" "$zero" ||
+      retain "durable host ref creation failed: $host_ref"
+  fi
+  verify_host_ref "$repository" "$host_ref" "$sha" ||
+    retain "durable host ref does not independently anchor $sha: $host_ref"
+}
+
+cleanup_fetch_refs() {
+  local repository=$1 namespace=$2 expected_sha=$3 stale_refs stale_ref stale_sha
+  stale_refs=$(git -C "$repository" for-each-ref "$namespace" --format='%(refname) %(objectname)') ||
+    retain "temporary fetch ref inventory failed: $repository"
+  while read -r stale_ref stale_sha; do
+    [[ -n $stale_ref ]] || continue
+    [[ $stale_sha == "$expected_sha" ]] ||
+      retain "stale fetch ref points to an unexpected SHA ($stale_ref=$stale_sha)"
+    git -C "$repository" update-ref -d "$stale_ref" "$stale_sha" ||
+      retain "temporary fetch ref cleanup failed: $stale_ref"
+  done <<<"$stale_refs"
+}
+
+trap cleanup EXIT
+trap interrupted HUP INT TERM
+
+assert_thread_state
+started=true
+"$runtime" exec "$sandbox" true >/dev/null || retain "sandbox unavailable"
+
+read_clone_state "$frontend_guest"
+frontend_ref=$observed_ref
+frontend_sha=$observed_sha
+read_clone_state "$backend_guest"
+backend_ref=$observed_ref
+backend_sha=$observed_sha
+
+# The primary clone retains Docker's generated host Git bridge.
+"$runtime" run "$sandbox" --version >/dev/null || retain "frontend Git bridge unavailable"
+frontend_remote=$("$runtime" remote "$sandbox" "$frontend_host") ||
+  retain "generated frontend remote not found after start"
+frontend_fetch_namespace="refs/stnt/fetch/$sandbox/frontend"
+frontend_fetch_ref="$frontend_fetch_namespace/$(uuidgen | tr '[:upper:]' '[:lower:]')"
+git -C "$frontend_host" fetch --no-tags --no-write-fetch-head "$frontend_remote" \
+  "$frontend_ref:$frontend_fetch_ref" || retain "frontend transfer failed"
+frontend_fetched_sha=$(git -C "$frontend_host" rev-parse --verify "$frontend_fetch_ref^{commit}") ||
+  retain "frontend transferred SHA unavailable"
+[[ $frontend_fetched_sha == "$frontend_sha" ]] ||
+  retain "frontend SHA mismatch (clone=$frontend_sha transferred=$frontend_fetched_sha)"
+create_or_verify_anchor "$frontend_host" "$frontend_host_ref" "$frontend_sha"
+
+if [[ ${STNT_STACK_INTERRUPT_AFTER:-} == frontend-anchor ]]; then
+  retain "synthetic interruption after preserving only the frontend"
+fi
+
+# The internal clone has no generated remote. Export one exact ref as a bundle,
+# copy it outward through Docker's narrow file-copy API, then import it through
+# another unique host ref.
+backend_bundle="$temporary/backend.bundle"
+"$runtime" stack-export "$sandbox" "$backend_guest" "$backend_ref" "$backend_bundle" ||
+  retain "backend bundle export failed"
+backend_fetch_namespace="refs/stnt/fetch/$sandbox/backend"
+backend_fetch_ref="$backend_fetch_namespace/$(uuidgen | tr '[:upper:]' '[:lower:]')"
+git -C "$backend_host" fetch --no-tags --no-write-fetch-head "$backend_bundle" \
+  "$backend_ref:$backend_fetch_ref" || retain "backend bundle import failed"
+backend_fetched_sha=$(git -C "$backend_host" rev-parse --verify "$backend_fetch_ref^{commit}") ||
+  retain "backend transferred SHA unavailable"
+[[ $backend_fetched_sha == "$backend_sha" ]] ||
+  retain "backend SHA mismatch (clone=$backend_sha transferred=$backend_fetched_sha)"
+create_or_verify_anchor "$backend_host" "$backend_host_ref" "$backend_sha"
+
+cleanup_fetch_refs "$frontend_host" "$frontend_fetch_namespace" "$frontend_sha"
+cleanup_fetch_refs "$backend_host" "$backend_fetch_namespace" "$backend_sha"
+
+if [[ ${STNT_STACK_INTERRUPT_AFTER:-} == anchors ]]; then
+  retain "synthetic interruption after preserving both repositories"
+fi
+
+# Revalidate both mutable clones and both independent host anchors immediately
+# before the one shared removal decision.
+assert_thread_state
+read_clone_state "$frontend_guest"
+final_frontend_ref=$observed_ref
+final_frontend_sha=$observed_sha
+read_clone_state "$backend_guest"
+final_backend_ref=$observed_ref
+final_backend_sha=$observed_sha
+[[ $final_frontend_ref == "$frontend_ref" && $final_frontend_sha == "$frontend_sha" ]] ||
+  retain "frontend branch or HEAD changed during $operation"
+[[ $final_backend_ref == "$backend_ref" && $final_backend_sha == "$backend_sha" ]] ||
+  retain "backend branch or HEAD changed during $operation"
+git -C "$frontend_host" update-ref "$frontend_host_ref" "$frontend_sha" "$frontend_sha" ||
+  retain "frontend durable host ref changed during $operation"
+git -C "$backend_host" update-ref "$backend_host_ref" "$backend_sha" "$backend_sha" ||
+  retain "backend durable host ref changed during $operation"
+verify_host_ref "$frontend_host" "$frontend_host_ref" "$frontend_sha" || retain "frontend anchor revalidation failed"
+verify_host_ref "$backend_host" "$backend_host_ref" "$backend_sha" || retain "backend anchor revalidation failed"
+
+"$runtime" stop "$sandbox" >/dev/null || retain "sandbox stop failed"
+started=false
+assert_thread_state
+phase=removing
+"$runtime" remove "$sandbox" || indeterminate "sandbox removal command failed"
+
+inventory=$("$runtime" list) || indeterminate "sandbox inventory unavailable"
+if ! printf '%s\n' "$inventory" | jq -s -e --arg name "$sandbox" '
+  length == 1 and
+  (.[0] | type == "object" and
+    (.sandboxes | type == "array") and
+    all(.sandboxes[]; type == "object" and (.name | type == "string")) and
+    (any(.sandboxes[]; .name == $name) | not))
+' >/dev/null; then
+  indeterminate "sandbox inventory was malformed or still contains the sandbox"
+fi
+remotes=$(git -C "$frontend_host" remote) || indeterminate "frontend Git remote inventory unavailable"
+while IFS= read -r candidate; do
+  [[ $candidate != "sandbox-$sandbox" ]] || indeterminate "generated frontend remote still exists after removal"
+done <<<"$remotes"
+verify_host_ref "$frontend_host" "$frontend_host_ref" "$frontend_sha" ||
+  indeterminate "frontend durable commit is unavailable after removal"
+verify_host_ref "$backend_host" "$backend_host_ref" "$backend_sha" ||
+  indeterminate "backend durable commit is unavailable after removal"
+
+printf 'removed=%s\nstack=%s\nfrontendBranch=%s\nfrontendSHA=%s\nbackendBranch=%s\nbackendSHA=%s\n' \
+  "$sandbox" "$stack_name" "$frontend_branch" "$frontend_sha" "$backend_branch" "$backend_sha"

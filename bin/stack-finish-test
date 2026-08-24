@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+finish="$root/bin/stack-finish"
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/stnt-stack-finish-test.XXXXXX")
+trap 'rm -rf "$temporary"' EXIT
+
+cat >"$temporary/thread" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${STNT_THREAD_MUST_NOT_RUN:-0} != 1 ]] || exit 99
+count=0
+[[ ! -e $STNT_THREAD_COUNT ]] || count=$(cat "$STNT_THREAD_COUNT")
+count=$((count + 1))
+printf '%s\n' "$count" >"$STNT_THREAD_COUNT"
+if [[ ${STNT_THREAD_FAIL_AT:-0} == "$count" ]]; then
+  echo active
+else
+  echo archived
+fi
+EOF
+
+cat >"$temporary/runtime" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+command=$1
+shift
+case "$command" in
+  exec|run|stop)
+    exit 0
+    ;;
+  stack-git-state)
+    sandbox=$1 guest=$2
+    if [[ ${STNT_FAIL_ROLE_STATE:-} == frontend && $guest == "$STNT_FRONTEND_CLONE" ]] ||
+       [[ ${STNT_FAIL_ROLE_STATE:-} == backend && $guest == "$STNT_BACKEND_CLONE" ]]; then
+      exit 88
+    fi
+    ref=$(git -C "$guest" symbolic-ref --quiet HEAD)
+    [[ $ref == refs/heads/* ]]
+    sha=$(git -C "$guest" rev-parse --verify HEAD^{commit})
+    [[ -z $(git -C "$guest" status --porcelain=v1 --untracked-files=all) ]]
+    git -C "$guest" for-each-ref --format='%(objectname)' refs/heads |
+      while read -r branch_sha; do
+        git -C "$guest" merge-base --is-ancestor "$branch_sha" "$sha"
+      done
+    if [[ ${STNT_MISMATCH_ROLE:-} == frontend && $guest == "$STNT_FRONTEND_CLONE" ]] ||
+       [[ ${STNT_MISMATCH_ROLE:-} == backend && $guest == "$STNT_BACKEND_CLONE" ]]; then
+      sha=$(git -C "$guest" rev-parse HEAD^)
+    fi
+    printf '%s\n%s\n' "$ref" "$sha"
+    ;;
+  remote)
+    [[ ${STNT_FAIL_TRANSFER_ROLE:-} != frontend ]] || exit 87
+    echo sandbox-$STNT_SANDBOX
+    ;;
+  stack-export)
+    [[ ${STNT_FAIL_TRANSFER_ROLE:-} != backend ]] || exit 87
+    sandbox=$1 guest=$2 ref=$3 destination=$4
+    git -C "$guest" bundle create "$destination" "$ref"
+    ;;
+  remove)
+    git -C "$STNT_FRONTEND_HOST" remote remove "sandbox-$STNT_SANDBOX" 2>/dev/null || true
+    touch "$STNT_REMOVED"
+    [[ ${STNT_REMOVE_UNCERTAIN:-0} != 1 ]] || exit 86
+    ;;
+  list)
+    if [[ -e $STNT_REMOVED ]]; then
+      echo '{"sandboxes":[]}'
+    else
+      printf '{"sandboxes":[{"name":"%s"}]}\n' "$STNT_SANDBOX"
+    fi
+    ;;
+  *)
+    echo "unexpected runtime command: $command" >&2
+    exit 99
+    ;;
+esac
+EOF
+chmod +x "$temporary/thread" "$temporary/runtime"
+
+make_case() {
+  local repository fixture_role clone
+  case_name=$1
+  case_root="$temporary/$case_name"
+  frontend_host="$case_root/frontend-host"
+  backend_host="$case_root/backend-host"
+  frontend_clone="$case_root/frontend-clone"
+  backend_clone="$case_root/backend-clone"
+  sandbox="stack-$case_name"
+  removed="$case_root/removed"
+  thread_count="$case_root/thread-count"
+  mkdir -p "$frontend_host" "$backend_host"
+  for repository in "$frontend_host" "$backend_host"; do
+    git -C "$repository" init -q -b main
+    git -C "$repository" config user.name "Stnt Stack Test"
+    git -C "$repository" config user.email stnt@example.invalid
+    printf 'base\n' >"$repository/base.txt"
+    git -C "$repository" add base.txt
+    git -C "$repository" commit -qm base
+  done
+  git clone -q "$frontend_host" "$frontend_clone"
+  git clone -q "$backend_host" "$backend_clone"
+  for fixture_role in frontend backend; do
+    eval clone=\$${fixture_role}_clone
+    git -C "$clone" config user.name "Stnt Stack Test"
+    git -C "$clone" config user.email stnt@example.invalid
+    printf '%s work\n' "$fixture_role" >"$clone/$fixture_role.txt"
+    git -C "$clone" add "$fixture_role.txt"
+    git -C "$clone" commit -qm "$fixture_role work"
+  done
+  frontend_sha=$(git -C "$frontend_clone" rev-parse HEAD)
+  backend_sha=$(git -C "$backend_clone" rev-parse HEAD)
+  git -C "$frontend_host" remote add "sandbox-$sandbox" "$frontend_clone"
+  common_env=(
+    STNT_RUNTIME="$temporary/runtime"
+    STNT_THREAD_ADAPTER="$temporary/thread"
+    STNT_SANDBOX="$sandbox"
+    STNT_FRONTEND_HOST="$frontend_host"
+    STNT_FRONTEND_CLONE="$frontend_clone"
+    STNT_BACKEND_CLONE="$backend_clone"
+    STNT_REMOVED="$removed"
+    STNT_THREAD_COUNT="$thread_count"
+  )
+  command_args=(
+    "$sandbox" proof-stack T-00000000-0000-0000-0000-000000000001
+    "$frontend_host" "$frontend_clone" "stnt-preserved/$case_name-frontend"
+    "$backend_host" "$backend_clone" "stnt-preserved/$case_name-backend"
+  )
+}
+
+run_finish() {
+  env "${common_env[@]}" "$@" "$finish" finish "${command_args[@]}"
+}
+
+run_detach() {
+  env "${common_env[@]}" "$@" "$finish" detach "${command_args[@]}"
+}
+
+expect_retained() {
+  local label=$1
+  shift
+  set +e
+  "$@" >"$case_root/output" 2>&1
+  status=$?
+  set -e
+  [[ $status -eq 1 && ! -e $removed ]] || {
+    echo "FAIL $label (status=$status removed=$([[ -e $removed ]] && echo yes || echo no))" >&2
+    cat "$case_root/output" >&2
+    exit 1
+  }
+  grep -Fq "preservation branches: frontend=" "$case_root/output"
+  grep -Fq "recover:" "$case_root/output"
+  echo "PASS $label"
+}
+
+make_case success
+run_finish >/dev/null
+[[ -e $removed ]]
+[[ $(git -C "$frontend_host" rev-parse refs/heads/stnt-preserved/success-frontend) == "$frontend_sha" ]]
+[[ $(git -C "$backend_host" rev-parse refs/heads/stnt-preserved/success-backend) == "$backend_sha" ]]
+[[ $(cat "$thread_count") == 3 ]]
+echo "PASS distinct frontend and backend commits are independently anchored before one removal"
+
+for role in frontend backend; do
+  make_case "dirty-$role"
+  eval clone=\$${role}_clone
+  printf dirty >"$clone/dirty.txt"
+  expect_retained "dirty $role clone blocks removal" run_finish
+  [[ ! -e $frontend_host/.git/refs/heads/stnt-preserved/dirty-$role-frontend ]]
+  [[ ! -e $backend_host/.git/refs/heads/stnt-preserved/dirty-$role-backend ]]
+done
+
+for role in frontend backend; do
+  make_case "detached-$role"
+  eval clone=\$${role}_clone
+  git -C "$clone" checkout -q --detach
+  expect_retained "detached $role HEAD blocks removal" run_finish
+
+  make_case "divergent-$role"
+  eval clone=\$${role}_clone
+  git -C "$clone" branch divergent HEAD^
+  git -C "$clone" switch -q divergent
+  printf divergent >"$clone/divergent.txt"
+  git -C "$clone" add divergent.txt
+  git -C "$clone" commit -qm divergent
+  git -C "$clone" switch -q main
+  expect_retained "divergent $role branch blocks removal" run_finish
+
+  make_case "mismatch-$role"
+  expect_retained "$role SHA mismatch blocks removal" run_finish STNT_MISMATCH_ROLE="$role"
+
+  make_case "transfer-$role"
+  expect_retained "$role transfer failure blocks removal" run_finish STNT_FAIL_TRANSFER_ROLE="$role"
+
+  make_case "conflict-$role"
+  eval host=\$${role}_host
+  git -C "$host" branch "stnt-preserved/conflict-$role-$role" main
+  expect_retained "$role host-ref conflict blocks removal" run_finish
+done
+
+make_case first-interrupt
+expect_retained "interruption after first anchor retains VM" run_finish STNT_STACK_INTERRUPT_AFTER=frontend-anchor
+[[ $(git -C "$frontend_host" rev-parse refs/heads/stnt-preserved/first-interrupt-frontend) == "$frontend_sha" ]]
+run_finish >/dev/null
+[[ -e $removed ]]
+echo "PASS retry after first anchor is idempotent"
+
+make_case anchors-interrupt
+expect_retained "interruption after both anchors retains VM" run_finish STNT_STACK_INTERRUPT_AFTER=anchors
+run_finish >/dev/null
+[[ -e $removed ]]
+echo "PASS retry after both anchors is idempotent"
+
+make_case authority
+expect_retained "finish rechecks archive authority after stop" run_finish STNT_THREAD_FAIL_AT=3
+[[ $(cat "$thread_count") == 3 ]]
+
+make_case detach
+run_detach STNT_THREAD_MUST_NOT_RUN=1 >/dev/null
+[[ -e $removed && ! -e $thread_count ]]
+echo "PASS detach never invokes the Amp adapter"
+
+make_case uncertain
+set +e
+run_finish STNT_REMOVE_UNCERTAIN=1 >"$case_root/output" 2>&1
+status=$?
+set -e
+[[ $status -eq 2 && -e $removed ]]
+grep -Fq "removal outcome unknown" "$case_root/output"
+grep -Fq "verify: git -C" "$case_root/output"
+echo "PASS uncertainty after removal begins reports verification and remains indeterminate"

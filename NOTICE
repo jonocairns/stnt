@@ -1,0 +1,12 @@
+Stnt
+Copyright 2026 Jono Cairns
+
+This product includes modified portions of Docker's sbx-kits-contrib Amp kit:
+
+  Source: https://github.com/docker/sbx-kits-contrib
+  Commit: ef2cc23ae634498161404953796f531bd540c8ad
+  Files adapted: amp/spec.yaml and amp/README.md
+  Copyright 2026 Docker, Inc.
+
+The adapted files are distributed under the Apache License, Version 2.0. They
+have been modified for Stnt's reviewed, retained Docker Sandbox workflow.

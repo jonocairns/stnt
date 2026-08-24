@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+runtime=${STNT_RUNTIME:-$root/bin/docker-sandbox}
+thread_adapter=${STNT_THREAD_ADAPTER:-$root/bin/amp-thread}
+
+usage() {
+  echo "usage: $0 verify <sandbox-sha> <fetched-sha> <host-ref-sha>" >&2
+  echo "       $0 finish <sandbox> <repository> <thread-id> <sandbox-branch|--current-branch> <host-branch>" >&2
+  echo "       $0 detach <sandbox> <repository> <workspace-or-thread-id> <sandbox-branch|--current-branch> <host-branch>" >&2
+  exit 2
+}
+
+verify_shas() {
+  [[ $# -eq 3 ]] || usage
+  sandbox_sha=$1
+  fetched_sha=$2
+  host_ref_sha=$3
+  if [[ $sandbox_sha != "$fetched_sha" || $sandbox_sha != "$host_ref_sha" ]]; then
+    echo "retain: SHA mismatch (sandbox=$sandbox_sha fetched=$fetched_sha host-ref=$host_ref_sha)" >&2
+    return 1
+  fi
+}
+
+command=${1:-}
+shift || true
+
+if [[ $command == verify ]]; then
+  verify_shas "$@"
+  exit
+fi
+
+if [[ $command != finish && $command != detach ]] || [[ $# -ne 5 ]]; then
+  usage
+fi
+operation=$command
+sandbox=$1
+repository=$2
+session_id=$3
+sandbox_branch=$4
+host_branch=$5
+host_ref="refs/heads/$host_branch"
+dynamic_branch=false
+if [[ $sandbox_branch == --current-branch ]]; then
+  dynamic_branch=true
+fi
+zero=0000000000000000000000000000000000000000
+started=false
+phase=pre-remove
+
+[[ $sandbox =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || usage
+if [[ $operation == finish ]]; then
+  [[ $session_id =~ ^T-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || usage
+else
+  [[ $session_id =~ ^[TW]-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || usage
+fi
+[[ $dynamic_branch == true ]] || git check-ref-format "refs/heads/$sandbox_branch" || usage
+git check-ref-format "$host_ref" || usage
+
+lock_root="$root/state/locks"
+mkdir -p "$lock_root"
+chmod 700 "$lock_root"
+lock="$lock_root/finish-$sandbox.lock"
+
+if ! mkdir "$lock" 2>/dev/null; then
+  echo "retain: another removal operation holds $lock" >&2
+  exit 1
+fi
+
+cleanup() {
+  rmdir "$lock" 2>/dev/null || true
+}
+
+retain() {
+  reason=$1
+  if [[ $started == true ]]; then
+    "$runtime" stop "$sandbox" >/dev/null 2>&1 || true
+  fi
+  echo "retain: $reason" >&2
+  echo "recover: $0 '$operation' '$sandbox' '$repository' '$session_id' '$sandbox_branch' '$host_branch'" >&2
+  exit 1
+}
+
+indeterminate() {
+  reason=$1
+  echo "removal outcome unknown: $reason" >&2
+  git -C "$repository" rev-parse --verify "$host_ref" >&2 || true
+  echo "verify: $runtime list" >&2
+  exit 2
+}
+
+interrupted() {
+  if [[ $phase == pre-remove ]]; then
+    retain "$operation interrupted"
+  fi
+  indeterminate "$operation interrupted after removal began"
+}
+
+read_sandbox_state() {
+  state=$(
+    "$runtime" exec "$sandbox" bash --noprofile --norc -c \
+      'set -e
+       ref=$(git symbolic-ref --quiet HEAD)
+       case "$ref" in refs/heads/*) ;; *) exit 1;; esac
+       git check-ref-format "$ref"
+       printf "%s\n" "$ref"
+       git rev-parse HEAD
+       git status --porcelain=v1 --untracked-files=all'
+  ) || retain "sandbox Git state unavailable"
+  actual_ref=$(printf '%s\n' "$state" | sed -n '1p')
+  actual_branch=${actual_ref#refs/heads/}
+  sandbox_sha=$(printf '%s\n' "$state" | sed -n '2p')
+  status=$(printf '%s\n' "$state" | sed '1,2d')
+}
+
+assert_all_branches_reachable() {
+  "$runtime" exec "$sandbox" bash --noprofile --norc -c '
+    set -euo pipefail
+    current_sha=$1
+    git for-each-ref --format="%(refname) %(objectname)" refs/heads |
+      while read -r ref sha; do
+        git merge-base --is-ancestor "$sha" "$current_sha" || {
+          echo "divergent branch: $ref at $sha" >&2
+          exit 1
+        }
+      done
+  ' bash "$sandbox_sha" >/dev/null ||
+    retain "a sandbox branch contains commits not reachable from current HEAD; select or merge the work before removal"
+}
+
+assert_thread_state() {
+  [[ $operation == finish ]] || return 0
+  thread_state=$("$thread_adapter" status "$session_id") ||
+    retain "Amp thread lookup failed or thread is unknown"
+  [[ $thread_state == archived ]] ||
+    retain "Amp thread is not archived (state=$thread_state)"
+}
+
+trap cleanup EXIT
+trap interrupted HUP INT TERM
+
+assert_thread_state
+
+started=true
+"$runtime" exec "$sandbox" true >/dev/null || retain "sandbox unavailable"
+
+read_sandbox_state
+[[ -z $status ]] || retain "sandbox clone is dirty; commit or otherwise preserve it explicitly, then rerun the recovery command"
+if [[ $dynamic_branch == true ]]; then
+  sandbox_branch=$actual_branch
+  dynamic_branch=false
+fi
+[[ $actual_branch == "$sandbox_branch" ]] ||
+  retain "sandbox branch changed (expected=$sandbox_branch actual=$actual_branch)"
+assert_all_branches_reachable
+
+# Docker creates its host Git bridge only for an attached agent run. Re-run the
+# harmless version command and rediscover the generated remote every time.
+"$runtime" run "$sandbox" --version >/dev/null || retain "sandbox Git bridge unavailable"
+remote=$("$runtime" remote "$sandbox" "$repository") ||
+  retain "generated sandbox remote not found after start"
+
+fetch_ref="refs/stnt/fetch/$sandbox/$(uuidgen | tr '[:upper:]' '[:lower:]')"
+git -C "$repository" fetch --no-tags --no-write-fetch-head "$remote" \
+  "$actual_ref:$fetch_ref" ||
+  retain "fetch from sandbox failed"
+fetched_sha=$(git -C "$repository" rev-parse --verify "$fetch_ref^{commit}") ||
+  retain "fetched SHA unavailable"
+[[ $sandbox_sha == "$fetched_sha" ]] ||
+  retain "SHA mismatch (sandbox=$sandbox_sha fetched=$fetched_sha)"
+
+if [[ ${STNT_INTERRUPT_AFTER:-} == fetch ]]; then
+  retain "synthetic interruption after fetch and before durable-ref creation"
+fi
+
+if existing_sha=$(git -C "$repository" rev-parse --verify "$host_ref" 2>/dev/null); then
+  [[ $existing_sha == "$sandbox_sha" ]] ||
+    retain "host ref already exists at another SHA ($host_ref=$existing_sha)"
+else
+  git -C "$repository" update-ref "$host_ref" "$sandbox_sha" "$zero" ||
+    retain "durable host ref creation failed"
+fi
+
+host_ref_sha=$(git -C "$repository" rev-parse --verify "$host_ref") ||
+  retain "durable host ref unavailable"
+verify_shas "$sandbox_sha" "$fetched_sha" "$host_ref_sha" || retain "independent SHA verification failed"
+git -C "$repository" merge-base --is-ancestor "$sandbox_sha" "$host_ref_sha" ||
+  retain "sandbox commit is not reachable from durable host ref"
+git -C "$repository" update-ref -d "$fetch_ref" "$fetched_sha" ||
+  retain "temporary fetch ref cleanup failed"
+stale_refs=$(git -C "$repository" for-each-ref "refs/stnt/fetch/$sandbox" \
+  --format='%(refname) %(objectname)') || retain "temporary fetch ref inventory failed"
+while read -r stale_ref stale_sha; do
+  [[ -n $stale_ref ]] || continue
+  [[ $stale_sha == "$sandbox_sha" ]] ||
+    retain "stale fetch ref points to an unexpected SHA ($stale_ref=$stale_sha)"
+  git -C "$repository" update-ref -d "$stale_ref" "$stale_sha" ||
+    retain "stale fetch ref cleanup failed ($stale_ref)"
+done <<<"$stale_refs"
+
+if [[ ${STNT_INTERRUPT_AFTER:-} == anchor ]]; then
+  retain "synthetic interruption after durable-ref creation and before removal"
+fi
+
+# Revalidate every mutable precondition as close as possible to the irreversible
+# boundary. The lock serializes cooperating Stnt removal callers; direct sbx,
+# Git, or Amp operations remain outside this prototype's concurrency boundary.
+assert_thread_state
+read_sandbox_state
+[[ -z $status ]] || retain "sandbox clone became dirty during $operation"
+[[ $actual_branch == "$sandbox_branch" ]] || retain "sandbox branch changed during $operation"
+[[ $sandbox_sha == "$host_ref_sha" ]] || retain "sandbox HEAD changed during $operation"
+assert_all_branches_reachable
+git -C "$repository" update-ref "$host_ref" "$sandbox_sha" "$sandbox_sha" ||
+  retain "durable host ref changed during $operation"
+
+"$runtime" stop "$sandbox" >/dev/null || retain "sandbox stop failed"
+started=false
+assert_thread_state
+phase=removing
+"$runtime" remove "$sandbox" || indeterminate "sandbox removal command failed"
+
+inventory=$("$runtime" list) || indeterminate "sandbox inventory unavailable"
+if ! printf '%s\n' "$inventory" | jq -s -e --arg name "$sandbox" '
+  length == 1 and
+  (.[0] | type == "object" and
+    (.sandboxes | type == "array") and
+    all(.sandboxes[]; type == "object" and (.name | type == "string")) and
+    (any(.sandboxes[]; .name == $name) | not))
+' >/dev/null; then
+  indeterminate "sandbox inventory was malformed or still contains the sandbox"
+fi
+remotes=$(git -C "$repository" remote) || indeterminate "Git remote inventory unavailable"
+while IFS= read -r candidate; do
+  [[ $candidate != "sandbox-$sandbox" ]] || indeterminate "generated remote still exists after removal"
+done <<<"$remotes"
+final_sha=$(git -C "$repository" rev-parse --verify "$host_ref^{commit}") ||
+  indeterminate "durable host ref disappeared after removal"
+[[ $final_sha == "$sandbox_sha" ]] || indeterminate "durable host ref changed after removal"
+git -C "$repository" cat-file -e "$final_sha^{commit}" ||
+  indeterminate "durable commit object is unavailable after removal"
+git -C "$repository" merge-base --is-ancestor "$sandbox_sha" "$host_ref" ||
+  indeterminate "durable commit is unreachable after removal"
+
+printf 'removed=%s\nbranch=%s\nsha=%s\n' "$sandbox" "$host_branch" "$sandbox_sha"

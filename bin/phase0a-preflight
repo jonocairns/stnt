@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "== host =="
+uname -m
+sw_vers
+echo
+
+echo "== Amp =="
+command -v amp
+amp --version
+echo "thread-list-json=$(
+  amp threads list --json --limit 1 |
+    jq -r 'if type == "array" then "array" else type end'
+)"
+echo
+
+echo "== Docker Sandboxes =="
+command -v sbx
+sbx version
+sbx daemon status
+if ! sbx ls --json; then
+  echo "sandbox-list=unavailable" >&2
+fi
+echo
+
+echo "== Docker sandbox secret names (values are never requested) =="
+sbx secret ls 2>/dev/null |
+  awk '$2 != "TARGETS" && $3 ~ /^[A-Z][A-Z0-9_]+$/ { print "target=" $2, "env=" $3 }' || true
+echo
+
+echo "== capacity =="
+df -h /Users
+printf 'host-memory-bytes='
+sysctl -n hw.memsize
