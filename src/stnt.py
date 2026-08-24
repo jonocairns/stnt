@@ -46,7 +46,7 @@ EDITOR_ALIAS_RE = re.compile(r"^[wt][0-9a-f]{32}-[0-9a-f]{12}\.stnt\.sbx$")
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
 INTERNAL_PORT = 8000
-SUPPORTED_SBX_VERSION = "v0.38.0"
+MINIMUM_SBX_VERSION = (0, 38, 0)
 SERVICE_HEALTH_TIMEOUT_SECONDS = 15.0
 KIT_SPEC = ROOT / "assets/amp-kit/spec.yaml"
 PROFILE_SCHEMA_VERSION = 1
@@ -275,7 +275,13 @@ def open_browser(service_url: str) -> None:
 
 
 def run(args: List[str], *, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(args, check=check, text=True, capture_output=capture)
+    return subprocess.run(
+        args,
+        check=check,
+        text=True,
+        capture_output=capture,
+        stdin=subprocess.DEVNULL if capture else None,
+    )
 
 
 def _emit_process_output(stdout: Optional[str], stderr: Optional[str]) -> None:
@@ -490,12 +496,14 @@ def docker_checks() -> List[Dict[str, Any]]:
         return []
     checks: List[Dict[str, Any]] = []
     version = run([str(RUNTIME), "version"], check=False)
-    match = re.search(r"\bv?\d+\.\d+\.\d+\b", version.stdout + version.stderr)
+    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)\b", version.stdout + version.stderr)
     actual_version = match.group(0) if match else None
-    if version.returncode != 0 or actual_version != SUPPORTED_SBX_VERSION:
-        checks.append(result("docker.version", "blocked", f"Docker Sandboxes version is {actual_version or 'unreadable'}; supported contract is {SUPPORTED_SBX_VERSION}", next_command="brew info --cask docker-sandboxes"))
+    parsed_version = tuple(int(part) for part in match.groups()) if match else None
+    minimum_version = "v" + ".".join(str(part) for part in MINIMUM_SBX_VERSION)
+    if version.returncode != 0 or parsed_version is None or parsed_version < MINIMUM_SBX_VERSION:
+        checks.append(result("docker.version", "blocked", f"Docker Sandboxes version is {actual_version or 'unreadable'}; minimum supported version is {minimum_version}", next_command="brew info --cask docker-sandboxes"))
     else:
-        checks.append(result("docker.version", "pass", f"Docker Sandboxes {actual_version} matches the supported contract"))
+        checks.append(result("docker.version", "pass", f"Docker Sandboxes {actual_version} meets the minimum supported version {minimum_version}"))
 
     kit = run([str(RUNTIME), "validate-kit"], check=False)
     checks.append(result("docker.kit", "pass" if kit.returncode == 0 else "blocked", "bundled schema-v2 Amp kit is valid" if kit.returncode == 0 else "bundled Amp kit validation failed", next_command=None if kit.returncode == 0 else "bin/docker-sandbox validate-kit"))
@@ -555,11 +563,6 @@ def docker_checks() -> List[Dict[str, Any]]:
     except (json.JSONDecodeError, ValueError):
         daemon_summary = "Docker diagnosis returned malformed JSON"
         auth_summary = "Docker login cannot be classified because diagnosis JSON is malformed"
-    if diagnosis.returncode != 0:
-        daemon_status = "blocked"
-        daemon_summary = "Docker diagnosis command failed"
-        auth_status = "blocked"
-        auth_summary = "Docker login cannot be trusted because diagnosis failed"
     checks.append(result("docker.daemon", daemon_status, daemon_summary, next_command=None if daemon_status == "pass" else "sbx daemon restart"))
     checks.append(result("docker.login", auth_status, auth_summary, next_command=None if auth_status == "pass" else "sbx login"))
 

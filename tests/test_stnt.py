@@ -1735,14 +1735,55 @@ class DoctorTests(unittest.TestCase):
             stnt, "run", side_effect=fake_run
         ):
             checks = {check["id"]: check for check in stnt.docker_checks()}
-        for check_id in ("docker.version", "docker.json", "docker.policy", "docker.secret"):
+        self.assertEqual(checks["docker.version"]["status"], "pass")
+        for check_id in ("docker.json", "docker.policy", "docker.secret"):
             self.assertEqual(checks[check_id]["status"], "blocked")
 
-    def test_nonzero_provider_with_plausible_json_and_null_inventory_fail_closed(self):
+    def test_sandbox_version_below_minimum_fails_closed(self):
+        def fake_run(args, **kwargs):
+            command = args[1]
+            outputs = {
+                "version": "sbx version: v0.37.9",
+                "validate-kit": "VALID",
+                "amp-binding-status": '{"approved":true,"fileExists":true}',
+                "github-binding-status": '{"approved":true,"fileExists":true}',
+                "daemon-status": "Status: stopped",
+            }
+            return subprocess.CompletedProcess(args, 0, outputs[command], "")
+
+        with mock.patch.object(stnt.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+            stnt, "run", side_effect=fake_run
+        ):
+            checks = {check["id"]: check for check in stnt.docker_checks()}
+
+        self.assertEqual(checks["docker.version"]["status"], "blocked")
+        self.assertIn("minimum supported version is v0.38.0", checks["docker.version"]["summary"])
+
+    def test_sandbox_version_above_minimum_is_supported(self):
+        def fake_run(args, **kwargs):
+            command = args[1]
+            outputs = {
+                "version": "sbx version: v1.0.0",
+                "validate-kit": "VALID",
+                "amp-binding-status": '{"approved":true,"fileExists":true}',
+                "github-binding-status": '{"approved":true,"fileExists":true}',
+                "daemon-status": "Status: stopped",
+            }
+            return subprocess.CompletedProcess(args, 0, outputs[command], "")
+
+        with mock.patch.object(stnt.shutil, "which", return_value="/bin/tool"), mock.patch.object(
+            stnt, "run", side_effect=fake_run
+        ):
+            checks = {check["id"]: check for check in stnt.docker_checks()}
+
+        self.assertEqual(checks["docker.version"]["status"], "pass")
+
+    def test_nonzero_diagnosis_still_classifies_healthy_critical_checks(self):
         diagnosis = {"checks": [
             {"name": "Daemon", "status": "pass"},
             {"name": "Socket", "status": "pass"},
             {"name": "Authentication", "status": "pass"},
+            {"name": "SSH client config", "status": "fail"},
         ]}
 
         def fake_run(args, **kwargs):
@@ -1766,7 +1807,9 @@ class DoctorTests(unittest.TestCase):
             stnt, "run", side_effect=fake_run
         ):
             checks = {check["id"]: check for check in stnt.docker_checks()}
-        for check_id in ("docker.daemon", "docker.login", "docker.json", "docker.policy", "docker.secret"):
+        for check_id in ("docker.daemon", "docker.login"):
+            self.assertEqual(checks[check_id]["status"], "pass")
+        for check_id in ("docker.json", "docker.policy", "docker.secret"):
             self.assertEqual(checks[check_id]["status"], "blocked")
 
     def test_explicit_policy_denial_does_not_prove_default_deny(self):
@@ -2564,6 +2607,32 @@ class LifecycleSafetyTests(unittest.TestCase):
             mock.call(["provider"], check=True, capture=True),
             mock.call(["provider"], check=False, capture=True),
         ])
+
+    def test_captured_commands_cannot_open_hidden_interactive_prompts(self):
+        completed = subprocess.CompletedProcess(["provider"], 0, "result\n", "")
+        with mock.patch.object(subprocess, "run", return_value=completed) as invoked:
+            self.assertIs(stnt.run(["provider"], check=False), completed)
+
+        invoked.assert_called_once_with(
+            ["provider"],
+            check=False,
+            text=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+        )
+
+    def test_streamed_commands_retain_terminal_input(self):
+        completed = subprocess.CompletedProcess(["provider"], 0, None, None)
+        with mock.patch.object(subprocess, "run", return_value=completed) as invoked:
+            self.assertIs(stnt.run(["provider"], capture=False), completed)
+
+        invoked.assert_called_once_with(
+            ["provider"],
+            check=True,
+            text=True,
+            capture_output=False,
+            stdin=None,
+        )
 
     def test_verbose_lifecycle_commands_stream_provider_output(self):
         completed = subprocess.CompletedProcess(["provider"], 0, None, None)

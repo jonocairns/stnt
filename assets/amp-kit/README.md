@@ -25,10 +25,10 @@ third-party schema-v2 kit, it also requires the user's separate `amp` /
 `apiKey` binding approval for exactly `ampcode.com` and `github` / `apiKey`
 approval for exactly `github.com`.
 
-Docker clone mode mirrors the host repository's absolute path inside the VM
-and provides no guest-path override in v0.38.0. The kit context therefore tells
-Amp to identify the workspace as a sandbox-private clone rather than the host
-checkout whenever it reports its location.
+Docker clone mode mirrors the host repository's absolute path inside the VM.
+The kit context therefore tells Amp to identify the workspace as a
+sandbox-private clone rather than the host checkout whenever it reports its
+location.
 
 Remaining mutable inputs are the base-image tag and the live installer script.
 The installer verifies the downloaded Amp binary against the release SHA-256,

@@ -51,7 +51,7 @@ Stnt currently requires:
 
 - macOS on Apple Silicon
 - [Amp](https://ampcode.com/) authenticated on the host
-- Docker Sandboxes v0.38.0, with `sandboxd` running
+- Docker Sandboxes v0.38.0 or newer, with `sandboxd` running
 - Git and `jq`
 - a normal Git checkout with a named branch and committed `HEAD`
 
