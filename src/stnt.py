@@ -1753,7 +1753,9 @@ def command_profile_review(command: str) -> int:
             ):
                 print("Repository profile is unchanged; no review or write was needed.")
                 return 0
-        with timed(f"{command}.review", "reviewing repository capabilities"):
+        # The review is interactive. A live progress line would repeatedly
+        # overwrite input() prompts while the command waits for approval.
+        with timed(f"{command}.review"):
             review_profile(profile, command=command)
         with timed(f"{command}.persist", "saving reviewed profile"):
             atomic_write(path, profile, create_only=command == "init")

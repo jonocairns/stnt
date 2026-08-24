@@ -700,6 +700,26 @@ export default {server};
                 self.assertEqual(stnt.main(["init"]), 1)
             self.assertFalse(stnt.profile_path(profile["repository"]).exists())
 
+    def test_interactive_review_does_not_run_under_a_progress_indicator(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = self.make_repo(root, self.service_less_fixture_files())
+            environment = {
+                "STNT_CONFIG_HOME": str(root / "config"),
+                "STNT_STATE_HOME": str(root / "state"),
+            }
+            with mock.patch.dict(os.environ, environment), mock.patch.object(
+                stnt, "configuration_repository", return_value=repo
+            ), mock.patch.object(stnt, "review_profile"), mock.patch.object(
+                stnt, "ProgressIndicator"
+            ) as indicator:
+                self.assertEqual(stnt.command_profile_review("init"), 0)
+
+            self.assertEqual(
+                [call.args[0] for call in indicator.call_args_list],
+                ["discovering repository configuration", "saving reviewed profile"],
+            )
+
     def test_init_is_creation_only_and_unchanged_reconfigure_does_not_write(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
