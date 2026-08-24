@@ -1315,6 +1315,25 @@ class LockingAndCreationTests(unittest.TestCase):
         with self.assertRaisesRegex(stnt.StntError, "path"):
             stnt.validate_record_repository(current, Path("/other"))
 
+    def test_repository_accepts_dirty_host_checkout_with_a_committed_head(self):
+        repo = Path("/fixture")
+
+        def fake_run(args, **kwargs):
+            if args == ["git", "rev-parse", "--show-toplevel"]:
+                return subprocess.CompletedProcess(args, 0, str(repo) + "\n", "")
+            if args[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+                return subprocess.CompletedProcess(args, 0, " M local-change\n", "")
+            if args[-2:] == ["branch", "--show-current"]:
+                return subprocess.CompletedProcess(args, 0, "feature\n", "")
+            if args[-2:] == ["rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
+            raise AssertionError(f"unexpected command: {args}")
+
+        with mock.patch.object(stnt.shutil, "which", return_value="/bin/git"), mock.patch.object(
+            stnt, "run", side_effect=fake_run
+        ), mock.patch.object(Path, "is_dir", return_value=True):
+            self.assertEqual(stnt.repository(), repo)
+
     def test_default_creation_uses_remote_default_not_current_checkout(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1794,6 +1813,23 @@ class DoctorTests(unittest.TestCase):
             invoked.call_args_list[0].args[0][:4],
             ["git", "--no-optional-locks", "-C", str(repo)],
         )
+
+    def test_dirty_host_is_a_nonblocking_warning_for_pinned_source_creation(self):
+        repo = Path("/fixture")
+        responses = [
+            subprocess.CompletedProcess([], 0, " M local-change\n", ""),
+            subprocess.CompletedProcess([], 0, "feature\n", ""),
+            subprocess.CompletedProcess([], 0, "a" * 40 + "\n", ""),
+        ]
+        with mock.patch.object(stnt.shutil, "which", return_value="/bin/git"), mock.patch.object(
+            stnt, "run", side_effect=responses
+        ), mock.patch.object(Path, "is_dir", return_value=True):
+            check = stnt.git_checks(repo)[0]
+
+        self.assertEqual(check["status"], "warning")
+        self.assertIn("pinned committed branch", check["summary"])
+        with mock.patch.object(stnt, "doctor_results", return_value=[check]):
+            stnt.critical_preflight(repo)
 
     def test_stopped_daemon_skips_daemon_backed_inventory(self):
         invoked = []

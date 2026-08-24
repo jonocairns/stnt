@@ -53,7 +53,7 @@ Stnt currently requires:
 - [Amp](https://ampcode.com/) authenticated on the host
 - Docker Sandboxes v0.38.0, with `sandboxd` running
 - Git and `jq`
-- a normal, clean Git checkout with a committed `HEAD`
+- a normal Git checkout with a named branch and committed `HEAD`
 
 Stnt uses Docker's host-side credential proxy for the Amp API key. Setup will
 check this and explain any action you need to take; it does not print or store
@@ -113,7 +113,7 @@ stnt reconfigure
 
 Repository profiles are currently best suited to projects with a root Nix
 flake and an aarch64-linux default development shell. A narrowly recognizable
-Vite `dev` script can also provide automatic service startup. Other clean Git
+Vite `dev` script can also provide automatic service startup. Other ordinary Git
 repositories can still use the basic isolated Amp workspace, but automatic
 toolchain and service setup may not be available yet.
 
@@ -227,9 +227,11 @@ It does **not**:
 - copy credential values into Stnt state or the sandbox filesystem.
 
 Clone mode prevents writes to your host checkout, but the sandbox can read the
-repository's ignored and untracked files through Docker's read-only source
-mount. Do not treat Stnt as a way to hide repository-local secrets from Amp.
-Amp runs with broad permissions inside the isolated microVM.
+host worktree—including local changes and ignored or untracked files—through
+Docker's read-only source mount. Those changes are not copied into the private
+clone, which starts from a pinned committed branch. Do not treat Stnt as a way
+to hide repository-local secrets from Amp. Amp runs with broad permissions
+inside the isolated microVM.
 
 When Stnt cannot prove the state of a workspace, Git clone, service, or stop
 operation, it retains the workspace and reports the next recovery command. It
@@ -292,14 +294,14 @@ to work when editor setup is unavailable.
 ## Current boundaries
 
 Stnt is intentionally narrow while its daily workflow is being proven. The
-current implementation supports one Docker runtime, clean ordinary Git
+current implementation supports one Docker runtime, ordinary Git
 repositories, zero or one reviewed HTTP(S) service, VS Code Remote SSH, and
 optional proxy-managed GitHub push access.
 
-Notable unsupported cases include dirty host patches, linked worktrees,
-submodules, Git LFS, non-GitHub push, arbitrary project toolchains, multiple
-published services, and non-Apple hosts. A fixed HTTPS project origin also
-means only one live workspace can currently bind that origin's port.
+Notable unsupported cases include linked worktrees, submodules, Git LFS,
+non-GitHub push, arbitrary project toolchains, multiple published services,
+and non-Apple hosts. A fixed HTTPS project origin also means only one live
+workspace can currently bind that origin's port.
 
 ## Development
 

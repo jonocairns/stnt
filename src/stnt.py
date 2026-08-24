@@ -403,11 +403,15 @@ def git_checks(repo: Optional[Path]) -> List[Dict[str, Any]]:
     head = run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=False)
     details.update({"branch": branch.stdout.strip(), "head": head.stdout.strip(), "clean": status.returncode == 0 and not status.stdout})
     if not ordinary:
-        return [result("git.repository", "blocked", "linked worktrees and non-ordinary Git directories are unsupported", next_command="cd to the repository's primary clean checkout", details=details)]
+        return [result("git.repository", "blocked", "linked worktrees and non-ordinary Git directories are unsupported", next_command="cd to the repository's primary checkout", details=details)]
     if status.returncode != 0 or branch.returncode != 0 or head.returncode != 0 or not branch.stdout.strip():
         return [result("git.repository", "blocked", "repository must have a named branch and committed HEAD", next_command="git status", details=details)]
     if status.stdout:
-        return [result("git.repository", "blocked", "host repository is dirty", next_command="git status --short", details=details)]
+        return [result(
+            "git.repository", "warning",
+            "host worktree has local changes; workspace Git starts from the pinned committed branch",
+            next_command="git status --short", details=details,
+        )]
     return [result("git.repository", "pass", f"clean {branch.stdout.strip()} at {head.stdout.strip()}", details=details)]
 
 
@@ -937,8 +941,6 @@ def repository() -> Path:
     repo = Path(result.stdout.strip()).resolve()
     if not (repo / ".git").is_dir():
         raise StntError("linked worktrees and non-ordinary Git directories are not supported in Phase 1A")
-    if run(["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"]).stdout:
-        raise StntError("host repository is dirty; commit or remove local changes before running stnt")
     branch = run(["git", "-C", str(repo), "branch", "--show-current"]).stdout.strip()
     if not branch:
         raise StntError("detached or unborn repositories are not supported in Phase 1A")
