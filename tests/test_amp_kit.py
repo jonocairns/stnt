@@ -87,6 +87,41 @@ EOF
         self.assertNotIn("--value", arguments)
         self.assertNotIn("--token", arguments)
 
+    def test_runtime_pipes_github_token_to_docker_without_exposing_it_in_arguments(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = pathlib.Path(temporary)
+            arguments_marker = directory / "args"
+            input_marker = directory / "input"
+            gh = directory / "gh"
+            gh.write_text("#!/bin/sh\nprintf 'github-secret\\n'\n")
+            gh.chmod(0o755)
+            sbx = directory / "sbx"
+            sbx.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' \"$@\" >\"$STNT_TEST_ARGS\"\n"
+                "cat >\"$STNT_TEST_INPUT\"\n"
+            )
+            sbx.chmod(0o755)
+            completed = subprocess.run(
+                [str(ROOT / "bin" / "docker-sandbox"), "github-secret-set"],
+                text=True,
+                capture_output=True,
+                env=dict(
+                    os.environ,
+                    PATH=f"{directory}:{os.environ['PATH']}",
+                    STNT_TEST_ARGS=str(arguments_marker),
+                    STNT_TEST_INPUT=str(input_marker),
+                ),
+            )
+            arguments = arguments_marker.read_text()
+            secret_input = input_marker.read_text()
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(arguments.splitlines(), ["secret", "set", "github"])
+        self.assertEqual(secret_input, "github-secret\n")
+        self.assertNotIn("github-secret", arguments)
+        self.assertNotIn("github-secret", completed.stdout)
+
     def test_runtime_creates_and_recognizes_only_the_narrow_stnt_bindings(self):
         with tempfile.TemporaryDirectory() as temporary:
             binding = pathlib.Path(temporary) / "sbx" / "credentials.yaml"

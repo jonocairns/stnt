@@ -5,7 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 kit="$root/assets/amp-kit"
 
 usage() {
-  echo "usage: $0 {version|daemon-status|diagnose|policy|policy-check|secrets|amp-secret-set|amp-binding-status|github-binding-status|stnt-bindings-enable|validate-kit|validate-kit-path|ssh-status|clipboard-image-paste-status|clipboard-image-paste-enable|create|create-stack|run|exec|hold|project-exec|project-input-link|editor-server-status|editor-server-install|stack-prepare|stack-verify|stack-git-state|stack-export|stack-start|stack-status|inspect|list|find|publish|ports|port|remote|tui-start|runner-start|service-start|service-start-argv|service-status|stop|remove} ..." >&2
+  echo "usage: $0 {version|daemon-status|diagnose|policy|policy-check|secrets|amp-secret-set|github-secret-set|amp-binding-status|github-binding-status|stnt-bindings-enable|validate-kit|validate-kit-path|ssh-status|clipboard-image-paste-status|clipboard-image-paste-enable|create|create-stack|run|exec|hold|project-exec|project-input-link|editor-server-status|editor-server-install|stack-prepare|stack-verify|stack-git-state|stack-export|stack-start|stack-status|inspect|list|find|publish|ports|port|remote|tui-start|runner-start|service-start|service-start-argv|service-status|stop|remove} ..." >&2
   exit 2
 }
 
@@ -131,6 +131,11 @@ case "$command" in
   amp-secret-set)
     [[ $# -eq 0 ]] || usage
     exec sbx secret set-custom --host ampcode.com --env AMP_API_KEY
+    ;;
+  github-secret-set)
+    [[ $# -eq 0 ]] || usage
+    command -v gh >/dev/null 2>&1 || { echo "GitHub CLI is unavailable" >&2; exit 1; }
+    gh auth token | sbx secret set github
     ;;
   amp-binding-status)
     [[ $# -eq 0 ]] || usage
