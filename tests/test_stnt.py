@@ -2060,6 +2060,8 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout") as initialize, mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2084,6 +2086,8 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout"), mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2116,6 +2120,8 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout"), mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2129,6 +2135,50 @@ class DoctorTests(unittest.TestCase):
         invoked.assert_called_once_with([str(stnt.RUNTIME), "clipboard-image-paste-status"], check=False)
         self.assertIn("enable explicitly: sbx settings set clipboard.imagePaste true", output.getvalue())
         self.assertIn("No Docker login, policy, secret, binding, daemon, SSH, editor, or clipboard setting change", output.getvalue())
+
+    def test_setup_delegates_amp_key_entry_to_docker_and_verifies_registration(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
+        changed = subprocess.CompletedProcess([], 0, None, None)
+        registered = subprocess.CompletedProcess(
+            [], 0, '[{"target":"ampcode.com","name":"AMP_API_KEY"}]', ""
+        )
+        output = Terminal()
+        with mock.patch.object(
+            stnt, "run", side_effect=[missing, changed, registered]
+        ) as invoked, mock.patch.object(
+            sys.stdin, "isatty", return_value=True
+        ), mock.patch("builtins.input", return_value="y") as approval, redirect_stdout(output):
+            self.assertTrue(stnt.configure_amp_secret())
+
+        approval.assert_called_once_with(
+            "Configure the Amp API key now using Docker's secure prompt? [y/N] "
+        )
+        self.assertEqual(invoked.call_args_list, [
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+            mock.call([str(stnt.RUNTIME), "amp-secret-set"], check=False, capture=False),
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+        ])
+        self.assertIn("did not read or store its value", output.getvalue())
+
+    def test_noninteractive_setup_prints_amp_secret_command_without_opening_a_prompt(self):
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
+        output = io.StringIO()
+        with mock.patch.object(
+            stnt, "run", return_value=missing
+        ) as invoked, mock.patch.object(
+            sys.stdin, "isatty", return_value=False
+        ), redirect_stdout(output):
+            self.assertFalse(stnt.configure_amp_secret())
+
+        invoked.assert_called_once_with([str(stnt.RUNTIME), "secrets"], check=False)
+        self.assertIn(
+            "configure explicitly: sbx secret set-custom --host ampcode.com --env AMP_API_KEY",
+            output.getvalue(),
+        )
 
     def test_setup_creates_stnt_bindings_only_after_interactive_approval(self):
         class Terminal(io.StringIO):
