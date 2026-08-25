@@ -4475,11 +4475,11 @@ def credential_binding_status(command: str) -> Optional[Dict[str, bool]]:
 
 
 def configure_amp_secret() -> bool:
-    secret_command = "sbx secret set-custom --host ampcode.com --env AMP_API_KEY"
+    setup_command = "sbx secret set-custom --host ampcode.com --env AMP_API_KEY"
     inventory = docker_secret_inventory()
     if inventory is None:
         print("Docker credential inventory is unavailable or unreadable; Stnt will not open a secret prompt.")
-        print(f"  inspect: {secret_command}")
+        print(f"  inspect: {setup_command}")
         return False
     if {"target": "ampcode.com", "name": "AMP_API_KEY"} in inventory:
         print("Docker already has AMP_API_KEY registered for ampcode.com.")
@@ -4487,12 +4487,12 @@ def configure_amp_secret() -> bool:
 
     print("Docker Sandboxes does not have an Amp API key registered for ampcode.com.")
     print("Create or copy an access token: https://ampcode.com/settings/security#access-token")
-    print(f"Stnt can run Docker's secret command without reading or storing the key: {secret_command}")
+    print(f"Stnt can run Docker's secret command without reading or storing the key: {setup_command}")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print(f"  configure explicitly: {secret_command}")
+        print(f"  configure explicitly: {setup_command}")
         return False
     if input("Configure the Amp API key now using Docker's secure prompt? [y/N] ").strip().lower() != "y":
-        print(f"Amp API key was not configured. Run later: {secret_command}")
+        print(f"Amp API key was not configured. Run later: {setup_command}")
         return False
 
     changed = run([str(RUNTIME), "amp-secret-set"], check=False, capture=False)
@@ -4506,11 +4506,11 @@ def configure_amp_secret() -> bool:
 
 
 def configure_github_secret() -> bool:
-    secret_command = "gh auth token | sbx secret set github"
+    setup_command = "gh auth token | sbx secret set github"
     inventory = docker_secret_inventory()
     if inventory is None:
         print("Docker credential inventory is unavailable or unreadable; Stnt will not register GitHub credentials.")
-        print(f"  inspect: {secret_command}")
+        print(f"  inspect: {setup_command}")
         return False
     if {"target": "github", "name": "GITHUB_TOKEN"} in inventory:
         print("Docker already has a GitHub credential registered.")
@@ -4519,10 +4519,10 @@ def configure_github_secret() -> bool:
     print("Docker Sandboxes does not have a GitHub credential registered.")
     print("Stnt can pipe the authenticated GitHub CLI token directly to Docker without reading or storing it.")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print(f"  configure explicitly: {secret_command}")
+        print(f"  configure explicitly: {setup_command}")
         return False
     if input("Register the GitHub credential from gh auth token now? [y/N] ").strip().lower() != "y":
-        print(f"GitHub credential was not configured. Run later: {secret_command}")
+        print(f"GitHub credential was not configured. Run later: {setup_command}")
         return False
 
     changed = run([str(RUNTIME), "github-secret-set"], check=False, capture=False)
