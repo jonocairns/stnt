@@ -853,12 +853,24 @@ def critical_preflight(
     *,
     require_host_amp: bool = False,
     require_github: bool = False,
+    offer_credentials: bool = False,
 ) -> None:
+    checks = doctor_results(repo)
+    if offer_credentials:
+        by_id = {check["id"]: check for check in checks}
+        changed = False
+        if by_id.get("docker.secret", {}).get("status") != "pass" and "docker.secret" in by_id:
+            changed = configure_amp_secret()
+        if (require_github and "docker.github-secret" in by_id and
+                by_id["docker.github-secret"].get("status") != "pass"):
+            changed = configure_github_secret() or changed
+        if changed:
+            checks = doctor_results(repo)
     required = CRITICAL_PREFLIGHT_IDS | (HOST_AMP_PREFLIGHT_IDS if require_host_amp else set())
     if require_github:
         required.update({"docker.github-secret", "docker.github-binding"})
     blocked = [
-        check for check in doctor_results(repo)
+        check for check in checks
         if check["id"] in required and (
             check["status"] == "blocked" or
             (check["id"] in {"docker.github-secret", "docker.github-binding"} and
@@ -3700,7 +3712,11 @@ def command_stack_start(name: str) -> None:
         ensure_stack_preservation_intent(record, profile)
     if record is None:
         require_stack_sources(profile)
-        critical_preflight(Path(stack_role(profile, "frontend")["path"]), require_host_amp=True)
+        critical_preflight(
+            Path(stack_role(profile, "frontend")["path"]),
+            require_host_amp=True,
+            offer_credentials=True,
+        )
         with creation_lock():
             record = create_stack_record(profile)
             ensure_stack_creation(record, profile)
@@ -4470,6 +4486,7 @@ def configure_amp_secret() -> bool:
         return False
 
     print("Docker Sandboxes does not have an Amp API key registered for ampcode.com.")
+    print("Create or copy an access token: https://ampcode.com/settings/security#access-token")
     print(f"Stnt can run Docker's secret command without reading or storing the key: {secret_command}")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print(f"  configure explicitly: {secret_command}")
@@ -4485,6 +4502,36 @@ def configure_amp_secret() -> bool:
     if verified is None or {"target": "ampcode.com", "name": "AMP_API_KEY"} not in verified:
         raise StntError("Docker completed secret entry but AMP_API_KEY registration could not be verified")
     print("Docker registered AMP_API_KEY for ampcode.com; Stnt did not read or store its value.")
+    return True
+
+
+def configure_github_secret() -> bool:
+    secret_command = "gh auth token | sbx secret set github"
+    inventory = docker_secret_inventory()
+    if inventory is None:
+        print("Docker credential inventory is unavailable or unreadable; Stnt will not register GitHub credentials.")
+        print(f"  inspect: {secret_command}")
+        return False
+    if {"target": "github", "name": "GITHUB_TOKEN"} in inventory:
+        print("Docker already has a GitHub credential registered.")
+        return False
+
+    print("Docker Sandboxes does not have a GitHub credential registered.")
+    print("Stnt can pipe the authenticated GitHub CLI token directly to Docker without reading or storing it.")
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print(f"  configure explicitly: {secret_command}")
+        return False
+    if input("Register the GitHub credential from gh auth token now? [y/N] ").strip().lower() != "y":
+        print(f"GitHub credential was not configured. Run later: {secret_command}")
+        return False
+
+    changed = run([str(RUNTIME), "github-secret-set"], check=False, capture=False)
+    if changed.returncode != 0:
+        raise StntError("Docker did not register the GitHub credential; verify: gh auth status")
+    verified = docker_secret_inventory()
+    if verified is None or {"target": "github", "name": "GITHUB_TOKEN"} not in verified:
+        raise StntError("Docker completed secret entry but GitHub credential registration could not be verified")
+    print("Docker registered the GitHub credential; Stnt did not read or store its value.")
     return True
 
 
@@ -4620,18 +4667,23 @@ def command_setup() -> int:
     print_doctor(checks)
     print("\nStnt initialized only its local state directories.")
     amp_secret_changed = configure_amp_secret()
-    if amp_secret_changed:
-        for check in checks:
-            if check["id"] == "docker.secret":
-                check["status"] = "pass"
+    github_secret_changed = configure_github_secret()
     binding_changed = configure_stnt_bindings()
     ssh_changed = configure_stnt_ssh()
     daemon_ready = any(check["id"] == "docker.daemon" and check["status"] == "pass" for check in checks)
     clipboard_changed = configure_clipboard_image_paste() if daemon_ready else False
-    if amp_secret_changed or binding_changed or ssh_changed or clipboard_changed:
+    changed = (
+        amp_secret_changed or github_secret_changed or binding_changed or
+        ssh_changed or clipboard_changed
+    )
+    if changed:
+        checks = doctor_results(optional_repository())
+    if changed:
         changes = []
         if amp_secret_changed:
             changes.append("Docker Amp credential")
+        if github_secret_changed:
+            changes.append("Docker GitHub credential")
         if binding_changed:
             changes.append("Stnt credential bindings")
         if ssh_changed:
@@ -4641,7 +4693,17 @@ def command_setup() -> int:
         print(f"Only the explicitly approved local {' and '.join(changes)} changed.")
     else:
         print("No Docker login, policy, secret, binding, daemon, SSH, editor, or clipboard setting change was made.")
-    print("Review each remaining command above and run it explicitly; global/shared changes require your approval.")
+    remaining = [
+        check for check in checks
+        if check["status"] != "pass" and check.get("nextCommand")
+    ]
+    if remaining:
+        print("\nRemaining actions:")
+        for check in remaining:
+            print(f"  [{check['status'].upper()}] {check['id']}: {check['nextCommand']}")
+        print("BLOCKED actions are required before workspace creation; WARNING actions are optional.")
+    else:
+        print("\nSetup complete; there are no remaining commands to run.")
     return 1 if any(check["status"] == "blocked" for check in checks) else 0
 
 
@@ -5105,6 +5167,7 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
                         require_github=bool(
                             reviewed_profile and github_push_remote(reviewed_profile[1])
                         ),
+                        offer_credentials=True,
                     )
                     created = create_record(
                         repo,
