@@ -1609,7 +1609,7 @@ with mock.patch.object(stnt, "repository", return_value=repo), \
                 stnt, "command_start"
             ) as start, mock.patch.object(stnt, "create_record", return_value=second) as create, mock.patch.object(
                 stnt, "critical_preflight"
-            ), mock.patch.object(stnt, "ensure_creation"):
+            ) as preflight, mock.patch.object(stnt, "ensure_creation"):
                 self.assertEqual(stnt.main([]), 0)
                 create.assert_not_called()
                 self.assertEqual(start.call_args.kwargs["selected"][1], current)
@@ -1618,6 +1618,7 @@ with mock.patch.object(stnt, "repository", return_value=repo), \
                 create.assert_called_once()
                 self.assertEqual(create.call_args.kwargs["from_branch"], "feature/example-work")
                 self.assertEqual(start.call_args.kwargs["selected"], second_pair)
+                self.assertTrue(preflight.call_args.kwargs["offer_credentials"])
 
 
 class DoctorTests(unittest.TestCase):
@@ -1664,6 +1665,34 @@ class DoctorTests(unittest.TestCase):
             stnt.critical_preflight(repo)
             with self.assertRaisesRegex(stnt.StntError, "(?s)docker.github-secret.*docker.github-binding"):
                 stnt.critical_preflight(repo, require_github=True)
+
+    def test_interactive_preflight_offers_required_credentials_and_rechecks(self):
+        repo = Path("/fixture")
+        missing = [stnt.result(
+            "docker.secret", "blocked", "not registered",
+            next_command="sbx secret set-custom --host ampcode.com --env AMP_API_KEY",
+        ), stnt.result(
+            "docker.github-secret", "warning", "not registered",
+            next_command="gh auth token | sbx secret set github",
+        )]
+        ready = [
+            stnt.result("docker.secret", "pass", "registered"),
+            stnt.result("docker.github-secret", "pass", "registered"),
+        ]
+        with mock.patch.object(
+            stnt, "doctor_results", side_effect=[missing, ready]
+        ) as doctor, mock.patch.object(
+            stnt, "configure_amp_secret", return_value=True
+        ) as amp, mock.patch.object(
+            stnt, "configure_github_secret", return_value=False
+        ) as github:
+            stnt.critical_preflight(
+                repo, require_github=True, offer_credentials=True,
+            )
+
+        amp.assert_called_once_with()
+        github.assert_called_once_with()
+        self.assertEqual(doctor.call_count, 2)
 
     def test_amp_binding_is_required_for_every_workspace(self):
         blocked = [stnt.result(
@@ -2060,6 +2089,10 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout") as initialize, mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
+            stnt, "configure_github_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2070,6 +2103,7 @@ class DoctorTests(unittest.TestCase):
         initialize.assert_called_once()
         global_command.assert_not_called()
         self.assertIn("No Docker login, policy, secret, binding, daemon, SSH, editor, or clipboard setting change", output.getvalue())
+        self.assertIn("[BLOCKED] docker.login: sbx login", output.getvalue())
 
     def test_setup_enables_clipboard_image_paste_only_after_interactive_approval(self):
         class Terminal(io.StringIO):
@@ -2084,6 +2118,10 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout"), mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
+            stnt, "configure_github_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2101,6 +2139,7 @@ class DoctorTests(unittest.TestCase):
             [str(stnt.RUNTIME), "clipboard-image-paste-status"],
         ])
         self.assertIn("Only the explicitly approved", output.getvalue())
+        self.assertIn("Setup complete; there are no remaining commands", output.getvalue())
 
     def test_setup_reports_revocation_when_clipboard_image_paste_is_already_enabled(self):
         enabled = subprocess.CompletedProcess([], 0, '{"value":true}', "")
@@ -2116,6 +2155,10 @@ class DoctorTests(unittest.TestCase):
         with mock.patch.object(stnt, "ensure_state_layout"), mock.patch.object(
             stnt, "optional_repository", return_value=None
         ), mock.patch.object(stnt, "doctor_results", return_value=checks), mock.patch.object(
+            stnt, "configure_amp_secret", return_value=False
+        ), mock.patch.object(
+            stnt, "configure_github_secret", return_value=False
+        ), mock.patch.object(
             stnt, "configure_stnt_bindings", return_value=False
         ), mock.patch.object(
             stnt, "configure_stnt_ssh", return_value=False
@@ -2129,6 +2172,108 @@ class DoctorTests(unittest.TestCase):
         invoked.assert_called_once_with([str(stnt.RUNTIME), "clipboard-image-paste-status"], check=False)
         self.assertIn("enable explicitly: sbx settings set clipboard.imagePaste true", output.getvalue())
         self.assertIn("No Docker login, policy, secret, binding, daemon, SSH, editor, or clipboard setting change", output.getvalue())
+
+    def test_setup_delegates_amp_key_entry_to_docker_and_verifies_registration(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
+        changed = subprocess.CompletedProcess([], 0, None, None)
+        registered = subprocess.CompletedProcess(
+            [], 0, '[{"target":"ampcode.com","name":"AMP_API_KEY"}]', ""
+        )
+        output = Terminal()
+        with mock.patch.object(
+            stnt, "run", side_effect=[missing, changed, registered]
+        ) as invoked, mock.patch.object(
+            sys.stdin, "isatty", return_value=True
+        ), mock.patch("builtins.input", return_value="y") as approval, redirect_stdout(output):
+            self.assertTrue(stnt.configure_amp_secret())
+
+        approval.assert_called_once_with(
+            "Configure the Amp API key now using Docker's secure prompt? [y/N] "
+        )
+        self.assertEqual(invoked.call_args_list, [
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+            mock.call([str(stnt.RUNTIME), "amp-secret-set"], check=False, capture=False),
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+        ])
+        self.assertIn("did not read or store its value", output.getvalue())
+        self.assertIn(
+            "https://ampcode.com/settings/security#access-token",
+            output.getvalue(),
+        )
+
+    def test_noninteractive_setup_prints_amp_secret_command_without_opening_a_prompt(self):
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
+        output = io.StringIO()
+        with mock.patch.object(
+            stnt, "run", return_value=missing
+        ) as invoked, mock.patch.object(
+            sys.stdin, "isatty", return_value=False
+        ), redirect_stdout(output):
+            self.assertFalse(stnt.configure_amp_secret())
+
+        invoked.assert_called_once_with([str(stnt.RUNTIME), "secrets"], check=False)
+        self.assertIn(
+            "configure explicitly: sbx secret set-custom --host ampcode.com --env AMP_API_KEY",
+            output.getvalue(),
+        )
+
+    def test_setup_pipes_github_credential_to_docker_and_verifies_registration(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        missing = subprocess.CompletedProcess([], 0, "[]", "")
+        changed = subprocess.CompletedProcess([], 0, None, None)
+        registered = subprocess.CompletedProcess(
+            [], 0, '[{"target":"github","name":"GITHUB_TOKEN"}]', ""
+        )
+        output = Terminal()
+        with mock.patch.object(
+            stnt, "run", side_effect=[missing, changed, registered]
+        ) as invoked, mock.patch.object(
+            sys.stdin, "isatty", return_value=True
+        ), mock.patch("builtins.input", return_value="y") as approval, redirect_stdout(output):
+            self.assertTrue(stnt.configure_github_secret())
+
+        approval.assert_called_once_with(
+            "Register the GitHub credential from gh auth token now? [y/N] "
+        )
+        self.assertEqual(invoked.call_args_list, [
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+            mock.call([str(stnt.RUNTIME), "github-secret-set"], check=False, capture=False),
+            mock.call([str(stnt.RUNTIME), "secrets"], check=False),
+        ])
+        self.assertIn("did not read or store its value", output.getvalue())
+
+    def test_setup_reruns_diagnostics_and_prints_current_remaining_actions(self):
+        initial = [stnt.result(
+            "docker.secret", "blocked", "not registered",
+            next_command="sbx secret set-custom --host ampcode.com --env AMP_API_KEY",
+        )]
+        ready = [stnt.result("docker.secret", "pass", "registered")]
+        output = io.StringIO()
+        with mock.patch.object(stnt, "ensure_state_layout"), mock.patch.object(
+            stnt, "optional_repository", return_value=None
+        ), mock.patch.object(
+            stnt, "doctor_results", side_effect=[initial, ready]
+        ) as doctor, mock.patch.object(
+            stnt, "configure_amp_secret", return_value=True
+        ), mock.patch.object(
+            stnt, "configure_github_secret", return_value=False
+        ), mock.patch.object(
+            stnt, "configure_stnt_bindings", return_value=False
+        ), mock.patch.object(
+            stnt, "configure_stnt_ssh", return_value=False
+        ), redirect_stdout(output):
+            self.assertEqual(stnt.command_setup(), 0)
+
+        self.assertEqual(doctor.call_count, 2)
+        self.assertIn("Setup complete; there are no remaining commands", output.getvalue())
+        self.assertNotIn("Review each remaining command above", output.getvalue())
 
     def test_setup_creates_stnt_bindings_only_after_interactive_approval(self):
         class Terminal(io.StringIO):

@@ -55,9 +55,10 @@ Stnt currently requires:
 - Git and `jq`
 - a normal Git checkout with a named branch and committed `HEAD`
 
-Stnt uses Docker's host-side credential proxy for the Amp API key. Setup will
-check this and explain any action you need to take; it does not print or store
-the credential value.
+Stnt uses Docker's host-side credential proxy for Amp and GitHub credentials.
+Interactive setup offers to register missing credentials, passing their values
+directly to Docker Sandboxes without exposing them to Stnt. A first workspace
+creation offers the same help for credentials that workspace requires.
 
 ### 2. Install the development checkout
 
@@ -83,9 +84,9 @@ stnt setup
 ```
 
 Setup checks Amp, Docker Sandboxes, credentials, SSH, VS Code, and the optional
-image-paste capability. It asks before installing Stnt's narrow SSH entry or
-enabling clipboard image paste. For anything it cannot configure safely, it
-prints the exact next command instead.
+image-paste capability. It asks before registering proxy-managed credentials,
+installing Stnt's narrow SSH entry, or enabling clipboard image paste. After
+any changes it reruns diagnostics and prints only the actions that remain.
 
 You can rerun setup at any time. It is designed to be idempotent.
 
